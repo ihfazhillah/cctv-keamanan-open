@@ -29,6 +29,8 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote, unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from encode import h264_encoder   # encoder auto (GPU->CPU)
+
 # diisi di main()
 ROOT = "."
 EVENTS_PATH = "events-live.jsonl"
@@ -301,7 +303,7 @@ def nvr_grab(start, end):
            f"/Streaming/tracks/{NVR['track']}?starttime={_hik(start)}&endtime={_hik(end)}")
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
            "-rtsp_transport", "tcp", "-i", src, "-t", str(int(dur) + 1),
-           "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", "-y", outpath]
+           "-c:v", h264_encoder(), "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", "-y", outpath]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=max(90, dur * 4 + 30))
     except subprocess.TimeoutExpired:

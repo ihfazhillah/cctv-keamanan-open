@@ -35,6 +35,7 @@ import requests
 
 from live import (FrameBuffer, EpisodeTracker, consume, SENTINEL, RuleEngine,
                   PendingNotifier, TransitAggregator, notif_aktif, SceneEpisode)
+from encode import reencode_h264   # encoder auto (GPU->CPU) -> jalan juga di laptop tanpa GPU
 
 
 TOKEN = os.environ["TG_TOKEN"]
@@ -433,15 +434,7 @@ class ClipRecorder:
         self.uploads.shutdown(wait=True)
 
 
-def reencode_h264(raw_name, final_name, duration=None):
-    """mp4v mentah -> h264 (nvenc) + faststart. Satu sumber utk klip & episode.
-    duration=None -> encode SEMUA frame (episode streaming sudah pas); angka -> pangkas
-    ke sekian detik (klip window: raw bisa punya sisa pre/post)."""
-    cmd = ["ffmpeg", "-i", raw_name]
-    if duration is not None:
-        cmd += ["-t", str(duration)]
-    cmd += ["-c:v", "h264_nvenc", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y", final_name]
-    subprocess.run(cmd, check=True)
+# reencode_h264 dipindah ke encode.py (dipakai bersama notify & viewer, encoder auto).
 
 
 # ══ STAGE 6b: perekam EPISODE (zone-driven, streaming) ═════════════════════════

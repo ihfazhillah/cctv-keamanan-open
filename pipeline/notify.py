@@ -9,6 +9,7 @@ import requests
 from pathlib import Path
 
 from store import detect_passages
+from encode import h264_encoder   # encoder auto (GPU->CPU)
 
 
 TOKEN = os.environ["TG_TOKEN"]
@@ -38,7 +39,7 @@ def cut_clip(video, start_s, end_s, pre, post, out):
     clip_start = max(0, start_s - pre)
     clip_end = end_s + post
     duration = clip_end - clip_start
-    command = ["ffmpeg", "-ss", str(clip_start), "-i", video, "-t", str(duration), "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "faststart", "-y", out]
+    command = ["ffmpeg", "-ss", str(clip_start), "-i", video, "-t", str(duration), "-c:v", h264_encoder(), "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "faststart", "-y", out]
     subprocess.run(command, check=True)
 
 

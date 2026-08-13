@@ -55,6 +55,25 @@ NVR_PASS=...
 
 Web viewer: `uv run pipeline/viewer.py` (baca `.env` untuk NVR).
 
+## Belajar/praktik offline (laptop tanpa GPU)
+
+Tujuan: bisa belajar **di mana saja** — cukup laptop + video yang sudah di-download.
+
+- **Baca & kuis:** materi (`lessons/`, `review/`) adalah HTML mandiri di repo belajar
+  (privat) — buka langsung di browser, **offline, tanpa kode/GPU**.
+- **Praktik pada video (bukan RTSP):** `run_live.py` menerima **file video** sebagai sumber.
+  Di rumah, unduh 1–2 klip (dari `out/` atau NVR via viewer) ke `samples/`, lalu di laptop:
+  ```bash
+  uv sync
+  uv run pipeline/run_live.py samples/klip.mp4 \
+      --zone-file zones-102.json --model yolo26l.pt --conf 0.15 --no-episode
+  ```
+- **Tanpa GPU NVIDIA:** encoder video dipilih otomatis (NVENC → libx264 → … , lihat
+  `pipeline/encode.py`), jadi klip/episode tetap jadi di CPU. Deteksi berjalan di CPU juga
+  (lebih lambat, cukup untuk belajar).
+- **Model:** salin file `*.pt` dari rumah, atau `yolo26l.pt` terunduh otomatis saat pertama
+  dipakai bila belum ada (butuh internet sekali).
+
 ## Zona
 
 `zones-102.json` = poligon pada geometri **640×360** (dipakai produksi); `zones.json` =
