@@ -1,0 +1,11 @@
+[project]
+name = "cctv-keamanan"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "requests>=2.34.2",
+    "supervision>=0.29.1",
+    "ultralytics>=8.4.102",
+]

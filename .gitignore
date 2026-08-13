@@ -1,0 +1,21 @@
+# lingkungan
+.venv/
+__pycache__/
+*.pyc
+
+# bobot model (unduh sendiri)
+*.pt
+
+# kredensial (JANGAN commit)
+.env
+
+# footage & data runtime (privasi — video rumah & aktivitas keluarga)
+out/
+samples/
+klip_*.mp4
+snap_*.jpg
+events-live.jsonl
+events-out.out
+episodes-live.jsonl
+debug.on
+debug-zona/out/

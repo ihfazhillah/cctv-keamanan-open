@@ -1,0 +1,14 @@
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.6
+track_buffer: 100 # analog lost_track_buffer (frame) - toleransi waktu fps=20 dan konfigrasi lama adalah 5 * fps
+match_thresh: 0.8
+fuse_score: true
+# bot-sort
+gmc_method: sparseOptFlow
+proximity_thresh: 0.5 
+appearance_thresh: 0.7 # knob rupa: ambang kemiripan
+with_reid: true # nyalakan reid
+model: auto  # pakai fitur model deteksi sendiri, tanpa unduh model kedua
+proximity_tresh: 0.9

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c2531"/><stop offset="1" stop-color="#0e131a"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <!-- badan kamera CCTV -->
+  <g transform="rotate(-16 64 64)">
+    <rect x="30" y="50" width="52" height="28" rx="8" fill="#4ea3d9"/>
+    <rect x="78" y="56" width="18" height="16" rx="4" fill="#3a7fb0"/>
+    <circle cx="44" cy="64" r="8" fill="#0e131a"/>
+    <circle cx="44" cy="64" r="3.5" fill="#8fd0ff"/>
+    <!-- braket -->
+    <rect x="58" y="40" width="6" height="14" rx="3" fill="#6b7a8c"/>
+    <rect x="40" y="36" width="46" height="6" rx="3" fill="#6b7a8c"/>
+  </g>
+  <!-- titik REC -->
+  <circle cx="94" cy="40" r="7" fill="#e8746b"/>
+  <circle cx="94" cy="40" r="12" fill="none" stroke="#e8746b" stroke-width="2" opacity=".4"/>
+</svg>
