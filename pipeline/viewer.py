@@ -16,6 +16,7 @@ tiap request).
 
 import os
 import re
+import sys
 import json
 import time
 import shutil
@@ -30,6 +31,13 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from encode import h264_encoder   # encoder auto (GPU->CPU)
+
+# segrec/ adalah sibling pipeline/ -> import pemotong segmen apa adanya (tanpa refactor)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "segrec"))
+try:
+    import cut as segcut            # pilih_segmen / cut(seg_dir,t0,t1,out)->path|None
+except Exception:                   # arsip jadi non-aktif kalau modul tak ada
+    segcut = None
 
 # diisi di main()
 ROOT = "."
@@ -240,7 +248,8 @@ def meta():
     days = sorted({dt_str(e["ts"])[:10] for e in events if e["live"]}, reverse=True)
     live_n = sum(1 for e in events if e["live"])
     return {"kinds": kinds, "zones": zones, "days": days,
-            "total": len(events), "live": live_n, "clips": n_clip, "nvr": NVR["ok"]}
+            "total": len(events), "live": live_n, "clips": n_clip,
+            "nvr": NVR["ok"], "segrec": SEGREC["ok"], "segMax": SEGREC["max_s"]}
 
 
 # ══ NVR: tarik footage penuh per rentang waktu (Hikvision RTSP playback) ═════════
@@ -322,6 +331,100 @@ def nvr_grab_from_qs(qs):
     except (ValueError, IndexError):
         return {"ok": False, "error": "parameter start/end tidak valid"}
     return nvr_grab(start, end)
+
+
+# ══ Arsip segrec: telusur rekaman penuh per waktu (segmen .ts bergulir) ══════════
+# segrec merekam A/V utuh -> out/segments/YYYYMMDD/HH/seg_*.ts. Fitur ini menjadikan
+# arsip itu bisa ditelusuri seperti NVR: pilih tanggal->jam->rentang, potong on-demand
+# via segrec/cut.py (-c copy, langsung playable+seekable), sajikan lewat _serve().
+SEGREC = {"seg_dir": "out/segments", "clip_dir": "out/segclip", "max_s": 300, "ok": False}
+
+
+def load_segrec(root, seg_dir, clip_dir, max_s):
+    SEGREC.update({"seg_dir": seg_dir, "clip_dir": clip_dir, "max_s": max_s})
+    SEGREC["ok"] = bool(segcut) and os.path.isdir(os.path.join(root, seg_dir))
+
+
+def seg_index():
+    """Hari->jam tersedia di arsip (dibaca dari struktur folder, murah tiap request)."""
+    out = {"ok": SEGREC["ok"], "tz": time.strftime("%Z"), "days": []}
+    if not SEGREC["ok"]:
+        return out
+    base = os.path.join(ROOT, SEGREC["seg_dir"])
+    try:
+        days = sorted((d for d in os.listdir(base) if re.fullmatch(r"\d{8}", d)), reverse=True)
+    except FileNotFoundError:
+        return out
+    for day in days:
+        dday = os.path.join(base, day)
+        hours = []
+        try:
+            hnames = sorted(os.listdir(dday))
+        except OSError:
+            continue
+        for h in hnames:
+            hd = os.path.join(dday, h)
+            if not (re.fullmatch(r"\d{2}", h) and os.path.isdir(hd)):
+                continue
+            try:
+                n = sum(1 for f in os.listdir(hd) if f.startswith("seg_") and f.endswith(".ts"))
+            except OSError:
+                n = 0
+            if n:
+                hours.append({"h": h, "n": n})
+        if hours:
+            out["days"].append({"day": day, "hours": hours})
+    return out
+
+
+def _seg_epoch_of(day, hms):
+    """day='YYYYMMDD', hms='HH:MM:SS' -> epoch LOKAL (mktime menormalkan overflow
+    menit/detik -> rentang lintas-jam aman). Otoritas TZ = server, samakan dgn segrec."""
+    parts = [int(x) for x in hms.split(":")] + [0, 0]
+    return time.mktime((int(day[0:4]), int(day[4:6]), int(day[6:8]),
+                        parts[0], parts[1], parts[2], 0, 0, -1))
+
+
+def seg_grab(start, end):
+    if not SEGREC["ok"]:
+        return {"ok": False, "error": "arsip segrec tak tersedia (out/segments / modul cut)"}
+    dur = end - start
+    if dur <= 0:
+        return {"ok": False, "error": "rentang tidak valid (end <= start)"}
+    if dur > SEGREC["max_s"]:
+        return {"ok": False, "error": f"rentang {dur:.0f}s melebihi batas {SEGREC['max_s']}s (--seg-max-seconds)"}
+
+    clip_dir = os.path.join(ROOT, SEGREC["clip_dir"])
+    os.makedirs(clip_dir, exist_ok=True)
+    fname = f"seg_{int(start)}_{int(end)}.mp4"
+    outpath = os.path.join(clip_dir, fname)
+    url_out = "/segclip/" + quote(fname)
+    if os.path.isfile(outpath) and os.path.getsize(outpath) > 1000:
+        return {"ok": True, "file": fname, "url": url_out, "seconds": round(dur, 1), "cached": True}
+
+    seg_dir = os.path.join(ROOT, SEGREC["seg_dir"])
+    try:
+        res = segcut.cut(seg_dir, start, end, outpath)
+    except Exception as e:
+        return {"ok": False, "error": f"cut gagal: {e}"}
+    if res and os.path.isfile(outpath) and os.path.getsize(outpath) > 1000:
+        return {"ok": True, "file": fname, "url": url_out,
+                "seconds": round(dur, 1), "size": os.path.getsize(outpath)}
+    return {"ok": False, "error": "tak ada segmen menutupi rentang (di luar retensi / segrec mati?)"}
+
+
+def seg_grab_from_qs(qs):
+    day = qs.get("day", [""])[0]
+    start_s = qs.get("start", [""])[0]
+    end_s = qs.get("end", [""])[0]
+    if not (re.fullmatch(r"\d{8}", day or "") and start_s and end_s):
+        return {"ok": False, "error": "parameter day/start/end tidak valid"}
+    try:
+        start = _seg_epoch_of(day, start_s)
+        end = _seg_epoch_of(day, end_s)
+    except (ValueError, IndexError):
+        return {"ok": False, "error": "format waktu tidak valid (HH:MM:SS)"}
+    return seg_grab(start, end)
 
 
 # ══ Episode: kelompokkan passage SE-ARAH jadi satu transit ══════════════════════
@@ -420,11 +523,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(read_arming())
         elif u.path == "/api/nvr/grab":
             self._json(nvr_grab_from_qs(qs))
+        elif u.path == "/api/seg/index":
+            self._json(seg_index())
+        elif u.path == "/api/seg/clip":
+            self._json(seg_grab_from_qs(qs))
         elif u.path.startswith("/media/"):
             self._serve(os.path.join(ROOT, MEDIA_DIR), u.path[len("/media/"):],
                         download=(qs.get("download", ["0"])[0] == "1"))
         elif u.path.startswith("/nvr/"):
             self._serve(os.path.join(ROOT, NVR["dir"]), u.path[len("/nvr/"):],
+                        download=(qs.get("download", ["0"])[0] == "1"))
+        elif u.path.startswith("/segclip/"):
+            self._serve(os.path.join(ROOT, SEGREC["clip_dir"]), u.path[len("/segclip/"):],
                         download=(qs.get("download", ["0"])[0] == "1"))
         else:
             self.send_error(404)
@@ -712,6 +822,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="seg" id="modeSeg" role="tablist">
         <button data-m="event" aria-selected="true">Event</button>
         <button data-m="episode" aria-selected="false">Episode</button>
+        <button data-m="arsip" aria-selected="false">Arsip</button>
       </div>
       <div class="search">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
@@ -791,6 +902,7 @@ async function loadMeta(){
   const dsel = $("#day");  m.days.forEach(d => dsel.add(new Option(d, d)));
   $("#kTotal").textContent = m.live;      // event live (yang punya jam nyata)
   $("#kClips").textContent = m.clips;
+  if(!m.segrec){ const b = $('#modeSeg [data-m="arsip"]'); if(b) b.hidden = true; }
 }
 
 function serverParams(){
@@ -817,6 +929,14 @@ function visible(){
       return true;
     });
   }
+  if(MODE==="arsip"){
+    const q = $("#q").value.trim().toLowerCase(), day = $("#day").value;
+    return ALL.filter(e => {
+      if(day && e.when.slice(0,10) !== day) return false;
+      if(q && !e.when.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }
   if(!activeKinds.size) return ALL;
   return ALL.filter(e => activeKinds.has(family(e.kind)));
 }
@@ -835,18 +955,24 @@ function epRow(e){
     <td class="mono dur">${e.dur.toFixed(1)}s</td>
     <td class="med">${e.media?"🎬 ":""}<span class="mono">×${e.count}</span></td>`;
 }
+function segRow(e){
+  return `<td class="mono">${e.when.slice(0,10)}</td>
+    <td class="mono">${e.hour}:00</td>
+    <td class="mono med">${e.n} segmen</td>
+    <td></td><td class="med">🎞</td>`;
+}
 
 function render(){
   const list = visible();
   const tb = $("#rows"); tb.innerHTML = "";
   $("#noRows").hidden = list.length > 0;
-  $("#count").textContent = list.length + (MODE==="episode" ? " episode" : " hasil");
+  $("#count").textContent = list.length + (MODE==="episode" ? " episode" : MODE==="arsip" ? " jam" : " hasil");
   $("#kShown").textContent = list.length;
   for(const e of list){
     const tr = document.createElement("tr");
     tr.tabIndex = 0;
     tr.setAttribute("aria-selected", e.id===selId ? "true" : "false");
-    tr.innerHTML = MODE==="episode" ? epRow(e) : evRow(e);
+    tr.innerHTML = MODE==="episode" ? epRow(e) : MODE==="arsip" ? segRow(e) : evRow(e);
     const pick = () => select(e.id);
     tr.onclick = pick;
     tr.onkeydown = ev => { if(ev.key==="Enter"||ev.key===" "){ ev.preventDefault(); pick(); } };
@@ -864,7 +990,10 @@ function select(id, playlistMode){
   const trs = $("#rows").children;
   if(idx>=0 && trs[idx]){ trs[idx].setAttribute("aria-selected","true"); trs[idx].scrollIntoView({block:"nearest"}); }
   const e = byId(id);
-  if(MODE==="episode"){
+  if(MODE==="arsip"){
+    SELE = e; $("#nvrWrap").innerHTML = "";
+    renderSegStage(e);
+  } else if(MODE==="episode"){
     SELE = Object.assign({}, e, {lo: e.start, hi: e.end});   // lo/hi -> renderNvr membentang episode
     renderEpStage(e); renderEpDetail(e); renderNvr(SELE);
   } else {
@@ -929,10 +1058,10 @@ function updateRange(){
   const fmt = ep => new Date(ep*1000).toLocaleTimeString("id-ID", {hour12:false});
   $("#nvrRange").textContent = `${fmt(start)} – ${fmt(end)}  (${(end-start).toFixed(1)}s)`;
 }
-function playUrl(url, file){
+function playUrl(url, file, tag){
   $("#stage").innerHTML = `
     <div class="screen"><video controls autoplay playsinline src="${url}"></video>
-      <div class="scan"></div><div class="rec"><span class="b"></span>NVR</div></div>
+      <div class="scan"></div><div class="rec"><span class="b"></span>${tag||"NVR"}</div></div>
     <div class="cap"><span class="fn mono">${file}</span><a href="${url}?download=1">⬇ unduh</a></div>`;
 }
 async function grabNvr(){
@@ -951,6 +1080,61 @@ async function grabNvr(){
         <span class="mono med">${r.file}</span></div>`;
       $("#nvrResult .playnvr").onclick = ev => playUrl(ev.currentTarget.dataset.u, ev.currentTarget.dataset.f);
       playUrl(r.url, r.file);
+    } else {
+      st.textContent = "gagal: " + r.error;
+    }
+  } catch(err){ st.textContent = "error: " + err; }
+  btn.disabled = false;
+}
+
+// ── arsip segrec: potong rentang waktu dari segmen ──
+async function fetchSegIndex(){
+  const r = await (await fetch("/api/seg/index")).json();
+  ALL = [];
+  (r.days||[]).forEach(d => (d.hours||[]).forEach(h => {
+    ALL.push({ id: ALL.length, day: d.day, hour: h.h, n: h.n,
+      when: `${d.day.slice(0,4)}-${d.day.slice(4,6)}-${d.day.slice(6,8)} ${h.h}:00` });
+  }));
+  render();
+}
+function renderSegStage(e){
+  $("#stage").innerHTML = `<div class="placeholder">Pilih rentang waktu di bawah, lalu <b>Putar rentang</b>.</div>`;
+  $("#detailWrap").innerHTML = `<div class="detail nvr">
+    <div class="qhead"><span class="eyebrow">Arsip ${e.when.slice(0,10)} · jam ${e.hour}:00 · ${e.n} segmen</span></div>
+    <div class="note">Potong rekaman utuh dari arsip untuk rentang pilihan (maks ${META.segMax||300}s). Lintas-jam boleh.</div>
+    <div class="nvrctl">
+      <label>dari <input id="segStart" type="time" step="1" value="${e.hour}:00:00" style="width:118px"></label>
+      <label>sampai <input id="segEnd" type="time" step="1" value="${e.hour}:00:30" style="width:118px"></label>
+      <span class="note mono" id="segRange"></span>
+    </div>
+    <div class="nvract"><button id="segPlay">▶ Putar rentang</button><span class="note" id="segStatus"></span></div>
+    <div id="segResult"></div></div>`;
+  $("#segStart").oninput = updateSegRange;
+  $("#segEnd").oninput = updateSegRange;
+  $("#segPlay").onclick = grabSeg;
+  updateSegRange();
+}
+function _hms(t){ const p=(t||"").split(":").map(Number); return (p[0]||0)*3600+(p[1]||0)*60+(p[2]||0); }
+function updateSegRange(){
+  const d = _hms($("#segEnd").value) - _hms($("#segStart").value);
+  $("#segRange").textContent = `${d} dtk`;
+}
+async function grabSeg(){
+  if(!SELE) return;
+  const day = SELE.day, start = $("#segStart").value, end = $("#segEnd").value;
+  const btn = $("#segPlay"), st = $("#segStatus");
+  btn.disabled = true;
+  st.innerHTML = '<span class="spinner"></span> memotong dari arsip…';
+  try {
+    const r = await (await fetch(`/api/seg/clip?day=${day}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`)).json();
+    if(r.ok){
+      st.textContent = r.cached ? "sudah ada (cache)" : `selesai · ${((r.size||0)/1e6).toFixed(1)} MB`;
+      $("#segResult").innerHTML = `<div class="done">
+        <button class="playseg" data-u="${r.url}" data-f="${r.file}">▶ putar hasil</button>
+        <a class="dl" href="${r.url}?download=1">⬇ unduh (${r.seconds}s)</a>
+        <span class="mono med">${r.file}</span></div>`;
+      $("#segResult .playseg").onclick = ev => playUrl(ev.currentTarget.dataset.u, ev.currentTarget.dataset.f, "ARSIP");
+      playUrl(r.url, r.file, "ARSIP");
     } else {
       st.textContent = "gagal: " + r.error;
     }
@@ -1028,8 +1212,8 @@ async function fetchEpisodes(){
   ALL = await (await fetch("/api/episodes?gap=" + gap)).json();
   render();
 }
-function fetchData(){ return MODE==="episode" ? fetchEpisodes() : fetchEvents(); }
-function refresh(){ return MODE==="episode" ? render() : fetchEvents(); }
+function fetchData(){ return MODE==="episode" ? fetchEpisodes() : MODE==="arsip" ? fetchSegIndex() : fetchEvents(); }
+function refresh(){ return MODE==="event" ? fetchEvents() : render(); }
 
 function setMode(m){
   if(m === MODE) return;
@@ -1038,13 +1222,16 @@ function setMode(m){
   document.querySelectorAll(".eventOnly").forEach(x => x.hidden = m!=="event");
   document.querySelectorAll(".episodeOnly").forEach(x => x.hidden = m!=="episode");
   const ths = document.querySelectorAll("thead th");
-  ths[1].textContent = m==="episode" ? "Arah" : "Jenis";
-  ths[2].textContent = m==="episode" ? "Gerbang" : "Zona";
+  ths[0].textContent = m==="arsip" ? "Tanggal" : "Waktu";
+  ths[1].textContent = m==="episode" ? "Arah" : m==="arsip" ? "Jam" : "Jenis";
+  ths[2].textContent = m==="episode" ? "Gerbang" : m==="arsip" ? "Segmen" : "Zona";
+  ths[3].textContent = m==="arsip" ? "" : "Durasi";
   ths[4].textContent = m==="episode" ? "#" : "";
-  $("#playAll").hidden = m==="episode";
+  $("#playAll").hidden = m!=="event";
   selId = null; SELE = null;
   $("#detailWrap").innerHTML = ""; $("#nvrWrap").innerHTML = "";
-  $("#stage").innerHTML = `<div class="placeholder">pilih sebuah ${m==="episode"?"episode":"event"}…</div>`;
+  const label = m==="episode" ? "episode" : m==="arsip" ? "jam arsip" : "event";
+  $("#stage").innerHTML = `<div class="placeholder">pilih sebuah ${label}…</div>`;
   $("#queueWrap").hidden = true;
   fetchData();
 }
@@ -1164,6 +1351,9 @@ def main():
                     help="track Hikvision utk playback penuh (ch2/taman=201, ch1/garasi=101)")
     ap.add_argument("--nvr-dir", default="out/nvr", help="folder simpan hasil tarikan NVR")
     ap.add_argument("--nvr-max-seconds", default=600, type=int, help="batas durasi satu tarikan NVR")
+    ap.add_argument("--seg-dir", default="out/segments", help="arsip segmen segrec (telusur per waktu)")
+    ap.add_argument("--seg-clip-dir", default="out/segclip", help="folder simpan hasil potong arsip")
+    ap.add_argument("--seg-max-seconds", default=300, type=int, help="batas durasi satu potongan arsip")
     args = ap.parse_args()
 
     ROOT = args.root
@@ -1171,6 +1361,7 @@ def main():
     MEDIA_DIR = args.media_dir
     ARMING_FILE = args.arming_file
     load_nvr(ROOT, args.nvr_track, args.nvr_dir, args.nvr_max_seconds)
+    load_segrec(ROOT, args.seg_dir, args.seg_clip_dir, args.seg_max_seconds)
 
     srv, port = start_server(args.host, args.port)
     url = f"http://{args.host}:{port}"
