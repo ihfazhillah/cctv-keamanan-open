@@ -32,6 +32,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from encode import h264_encoder   # encoder auto (GPU->CPU)
+import db                          # sumber tunggal event (taman + garasi) via cctv.db
 
 # segrec/ adalah sibling pipeline/ -> import pemotong segmen apa adanya (tanpa refactor)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "segrec"))
@@ -48,45 +49,54 @@ EVENTS_PATH = "events-live.jsonl"
 MEDIA_DIR = "out/live"
 ARMING_FILE = "arming.json"
 CAMERAS_FILE = "cameras.json"
+DB_PATH = "cctv.db"
 
 EPOCH_MIN = 1_000_000_000        # ts di atas ini = wall-clock epoch (event live), bukan detik-file relatif
 CLIP_KINDS = {"close", "loiter"}
+# kinds yang tampil di log Event (mirror events-live.jsonl lama + garasi). Sengaja
+# TAK ikut: 'episode' (mode Episode terpisah, di-derive) & 'keluar'/'masuk' lowercase
+# (transit klip internal).
+LOG_KINDS = ("close", "loiter", "KELUAR rumah", "KELUAR property",
+             "MASUK rumah", "MASUK property", "garasi")
 
 
 # ══ Lapisan data ═══════════════════════════════════════════════════════════════
 def load_events():
-    """events-live.jsonl -> list event ternormalisasi (id, kind, zone, ts, lo, hi, dur, live)."""
+    """cctv.db `events` (kinds tampil) -> list event ternormalisasi. DB = SUMBER
+    TUNGGAL (taman + garasi). payload JSON identik dgn baris events-live.jsonl lama;
+    `camera` dari payload (default 'taman' utk event lama tanpa tag)."""
     out = []
     try:
-        f = open(os.path.join(ROOT, EVENTS_PATH))
-    except FileNotFoundError:
+        con = db.connect(os.path.join(ROOT, DB_PATH), check_same_thread=False)
+    except Exception:
         return out
-    with f:
-        for i, line in enumerate(f):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            kind = e.get("kind")
-            if "start" in e and "end" in e:            # close
-                ts, lo, hi = e["start"], e["start"], e["end"]
-            elif "start" in e and "at" in e:           # loiter (alert @at, mulai @start)
-                ts, lo, hi = e["at"], e["at"], e["at"]
-            else:                                       # passage (@at)
-                ts = lo = hi = e.get("at", 0.0)
-            out.append({
-                "id": i,
-                "kind": kind,
-                "zone": e.get("zone"),
-                "species": e.get("species"),
-                "ts": ts, "lo": lo, "hi": hi,
-                "dur": (e["end"] - e["start"]) if ("start" in e and "end" in e) else None,
-                "live": ts >= EPOCH_MIN,
-                "raw": e,
-            })
+    try:
+        q = ("SELECT id, ts, kind, zone, species, clip, payload FROM events "
+             "WHERE kind IN (%s) ORDER BY id" % ",".join("?" * len(LOG_KINDS)))
+        rows = con.execute(q, LOG_KINDS).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        con.close()
+    for r in rows:
+        e = json.loads(r["payload"]) if r["payload"] else {"kind": r["kind"]}
+        if "start" in e and "end" in e:            # close / transit-clip
+            ts, lo, hi = e["start"], e["start"], e["end"]
+        elif "start" in e and "at" in e:           # loiter (alert @at, mulai @start)
+            ts, lo, hi = e["at"], e["at"], e["at"]
+        else:                                       # passage / garasi (@at)
+            ts = lo = hi = e.get("at", r["ts"] or 0.0)
+        out.append({
+            "id": r["id"],
+            "kind": e.get("kind") or r["kind"],
+            "zone": e.get("zone") if e.get("zone") is not None else r["zone"],
+            "species": e.get("species") if e.get("species") is not None else r["species"],
+            "camera": e.get("camera", "taman"),
+            "ts": ts, "lo": lo, "hi": hi,
+            "dur": (e["end"] - e["start"]) if ("start" in e and "end" in e) else None,
+            "live": ts >= EPOCH_MIN,
+            "raw": e,
+        })
     return out
 
 
@@ -191,6 +201,7 @@ def enrich_and_filter(qs):
     q = (qs.get("q", [""])[0] or "").strip().lower()
     kind = qs.get("kind", [""])[0]
     zone = qs.get("zone", [""])[0]
+    cam = qs.get("camera", [""])[0]
     frm = qs.get("from", [""])[0]
     to = qs.get("to", [""])[0]
     live_only = qs.get("live", ["1"])[0] == "1"
@@ -216,6 +227,8 @@ def enrich_and_filter(qs):
             continue
         if zone and ev["zone"] != zone:
             continue
+        if cam and ev["camera"] != cam:
+            continue
         if frm_ts is not None and ev["ts"] < frm_ts:
             continue
         if to_ts is not None and ev["ts"] >= to_ts:
@@ -232,6 +245,7 @@ def enrich_and_filter(qs):
             "kind": ev["kind"],
             "zone": ev["zone"],
             "species": ev["species"],
+            "camera": ev["camera"],
             "ts": ev["ts"],
             "lo": ev["lo"], "hi": ev["hi"],   # untuk pra-isi rentang tarikan NVR
             "when": dt_str(ev["ts"]),
@@ -249,9 +263,10 @@ def meta():
     _, _, _, n_clip = scan_media()
     kinds = sorted({e["kind"] for e in events if e["kind"]})
     zones = sorted({e["zone"] for e in events if e["zone"]})
+    cameras = sorted({e["camera"] for e in events if e.get("camera")})
     days = sorted({dt_str(e["ts"])[:10] for e in events if e["live"]}, reverse=True)
     live_n = sum(1 for e in events if e["live"])
-    return {"kinds": kinds, "zones": zones, "days": days,
+    return {"kinds": kinds, "zones": zones, "cameras": cameras, "days": days,
             "total": len(events), "live": live_n, "clips": n_clip,
             "nvr": NVR["ok"], "segrec": SEGREC["ok"], "segMax": SEGREC["max_s"]}
 
@@ -903,6 +918,7 @@ INDEX_HTML = r"""<!doctype html>
   .tag.k-exit{ background:var(--ev-exit-bg); color:var(--ev-exit); }
   .tag.k-dwell{ background:var(--ev-dwell-bg); color:var(--ev-dwell); }
   .tag.k-loiter{ background:var(--ev-loiter-bg); color:var(--ev-loiter); }
+  .tag.k-garasi{ background:var(--ev-dwell-bg); color:var(--ev-dwell); }
   .tag.k-plain{ background:var(--panel2); color:var(--dim); }
   .zone { color:var(--fg); }
   .cat { color:var(--ev-cat); font-weight:600; }
@@ -1004,6 +1020,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="chip k-exit"   data-k="KELUAR"  aria-pressed="false">keluar</button>
       </div>
       <div class="frow">
+        <select id="cam" class="eventOnly" aria-label="Kamera" hidden><option value="">semua kamera</option></select>
         <select id="zone" class="eventOnly" aria-label="Zona"><option value="">semua zona</option></select>
         <select id="day" aria-label="Hari"><option value="">semua hari</option></select>
       </div>
@@ -1071,6 +1088,7 @@ const $ = s => document.querySelector(s);
 let ALL = [], selId = null, activeKinds = new Set(), queue = [], qOn = -1, META = {}, SELE = null, MODE = "event";
 
 const kindClass = k => k==="close" ? "k-dwell" : k==="loiter" ? "k-loiter"
+  : k==="garasi" ? "k-garasi"
   : k.startsWith("MASUK") ? "k-enter" : k.startsWith("KELUAR") ? "k-exit" : "k-plain";
 const kindIcon = m => !m ? "" : (m.type==="video" ? "🎬" : "🖼");
 const family = k => k==="close" ? "close" : k==="loiter" ? "loiter" : k.split(" ")[0];
@@ -1081,6 +1099,11 @@ async function loadMeta(){
   META = m;
   const zsel = $("#zone"); m.zones.forEach(z => zsel.add(new Option(z, z)));
   const dsel = $("#day");  m.days.forEach(d => dsel.add(new Option(d, d)));
+  const csel = $("#cam");
+  if(m.cameras && m.cameras.length > 1){          // tampilkan pemilih kamera hanya bila >1
+    m.cameras.forEach(c => csel.add(new Option(c, c)));
+    csel.hidden = false;
+  }
   $("#kTotal").textContent = m.live;      // event live (yang punya jam nyata)
   $("#kClips").textContent = m.clips;
   if(!m.segrec){ const b = $('#modeSeg [data-m="arsip"]'); if(b) b.hidden = true; }
@@ -1089,6 +1112,7 @@ async function loadMeta(){
 function serverParams(){
   const p = new URLSearchParams();
   if($("#q").value.trim()) p.set("q", $("#q").value.trim());
+  if($("#cam").value) p.set("camera", $("#cam").value);
   if($("#zone").value) p.set("zone", $("#zone").value);
   if($("#day").value){ p.set("from", $("#day").value); p.set("to", $("#day").value); }
   p.set("live", "1");
@@ -1480,7 +1504,7 @@ function setMode(m){
 let t;
 $("#q").oninput = () => { clearTimeout(t); t = setTimeout(refresh, 200); };
 $("#day").onchange = refresh;
-["zone","mediaOnly"].forEach(id => $("#"+id).onchange = fetchEvents);
+["zone","mediaOnly","cam"].forEach(id => $("#"+id).onchange = fetchEvents);
 $("#gap").oninput = () => { clearTimeout(t); t = setTimeout(fetchEpisodes, 250); };
 $("#modeSeg").addEventListener("click", ev => { const b = ev.target.closest("button"); if(b) setMode(b.dataset.m); });
 $("#kindChips").addEventListener("click", ev => {
@@ -1491,7 +1515,7 @@ $("#kindChips").addEventListener("click", ev => {
   render();
 });
 $("#clear").onclick = () => {
-  $("#q").value=""; $("#zone").value=""; $("#day").value=""; $("#mediaOnly").checked=false;
+  $("#q").value=""; $("#zone").value=""; $("#day").value=""; $("#cam").value=""; $("#mediaOnly").checked=false;
   activeKinds.clear();
   document.querySelectorAll(".chip").forEach(c => c.setAttribute("aria-pressed","false"));
   $("#queueWrap").hidden = true;
@@ -1648,13 +1672,14 @@ def find_app_browser():
 
 
 def main():
-    global ROOT, EVENTS_PATH, MEDIA_DIR, ARMING_FILE, CAMERAS_FILE
+    global ROOT, EVENTS_PATH, MEDIA_DIR, ARMING_FILE, CAMERAS_FILE, DB_PATH
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".", help="folder berisi events-live.jsonl & out/live")
     ap.add_argument("--events", default="events-live.jsonl")
     ap.add_argument("--media-dir", default="out/live")
     ap.add_argument("--arming-file", default="arming.json")
     ap.add_argument("--cameras-file", default="cameras.json")
+    ap.add_argument("--db", default="cctv.db", help="SQLite bersama (sumber event)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", default=8477, type=int, help="port pilihan (kalau sibuk, dipilih otomatis)")
     ap.add_argument("--no-open", action="store_true",
@@ -1675,6 +1700,7 @@ def main():
     MEDIA_DIR = args.media_dir
     ARMING_FILE = args.arming_file
     CAMERAS_FILE = args.cameras_file
+    DB_PATH = args.db
     load_nvr(ROOT, args.nvr_track, args.nvr_dir, args.nvr_max_seconds)
     load_segrec(ROOT, args.seg_dir, args.seg_clip_dir, args.seg_max_seconds)
 
