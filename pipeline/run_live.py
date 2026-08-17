@@ -49,6 +49,10 @@ TG_VIA_BOT = os.environ.get("TG_VIA_BOT") == "1"
 # andal, kebal kedip track) alih-alih transit (rapuh). Transit -> notify=0 (tak dobel);
 # episode masuk/keluar -> notify=1 (saring 'lewat'/jalan-utama). Default: transit seperti biasa.
 NOTIFY_FROM_EPISODE = os.environ.get("NOTIFY_FROM_EPISODE") == "1"
+# SKIP_PIPELINE_CLIP=1 -> inti TAK meng-encode klip/episode sendiri (klip diambil dari
+# segmen segrec). Hilangkan encode-spike (fps=0) + hentikan pertumbuhan out/live +
+# hemat GPU. Event tetap ditulis ke DB (tanpa path klip). Butuh segrec tepercaya.
+SKIP_PIPELINE_CLIP = os.environ.get("SKIP_PIPELINE_CLIP") == "1"
 
 
 def jam(t):
@@ -458,7 +462,19 @@ class ClipRecorder:
     def _reencode(self, raw_name, clip_name, duration):
         reencode_h264(raw_name, clip_name, duration)
 
+    def _mirror_event(self, ev, clip):
+        """Tulis event ke DB. transit -> notify=0 saat NOTIFY_FROM_EPISODE (episode yg
+        kabari); close/loiter tetap notify=1 (alert mandiri)."""
+        if not self.writer:
+            return
+        notify_clip = 0 if (NOTIFY_FROM_EPISODE and ev["kind"] in self.TRANSIT_KINDS) else 1
+        self.writer.tulis(ts=self._event_time(ev), kind=ev["kind"], zone=ev.get("zone"),
+                          species=ev.get("species"), clip=clip, notify=notify_clip, payload=ev)
+
     def _write_clip(self, ev, pending):
+        if SKIP_PIPELINE_CLIP:                    # klip diambil dari segmen segrec -> inti tak encode
+            self._mirror_event(ev, None)
+            return
         frames = pending["frames"]
         t0, t1 = pending["t0"], pending["t1"]
         if not frames:
@@ -481,15 +497,7 @@ class ClipRecorder:
 
         self._reencode(raw_name, final_name, t1 - t0)
         os.remove(raw_name)                      # raw cuma untuk reencode; final sudah tersimpan
-        # mirror ke DB (notify=1: layak diberitahu). Ditulis SELALU, apa pun mode kirim,
-        # supaya bot bisa melihatnya. arah disimpan di payload (kind/gates) untuk caption bot.
-        if self.writer:
-            # transit (masuk/keluar) -> notify=0 saat NOTIFY_FROM_EPISODE (episode yg kabari);
-            # close/loiter tetap notify=1 (alert mandiri).
-            notify_clip = 0 if (NOTIFY_FROM_EPISODE and ev["kind"] in self.TRANSIT_KINDS) else 1
-            self.writer.tulis(ts=self._event_time(ev), kind=ev["kind"], zone=ev.get("zone"),
-                              species=ev.get("species"), clip=os.path.basename(final_name),
-                              notify=notify_clip, payload=ev)
+        self._mirror_event(ev, os.path.basename(final_name))   # mirror ke DB (payload utk caption bot)
         if self.tg_via_bot:
             return                               # inti diam; service bot yang mengirim
         # jadwal arming (mode A): senyap -> klip TETAP tersimpan, upload dilewati
@@ -566,18 +574,26 @@ class EpisodeRecorder:
     def observe(self, t, frame, occupied):
         for ev in self.scene.update(occupied, t):
             if ev["kind"] == "episode_mulai":
-                self._buka(t, frame)
+                if not SKIP_PIPELINE_CLIP:
+                    self._buka(t, frame)
             elif ev["kind"] == "episode":
-                if self.writer is not None:
-                    self.writer.write(frame)          # frame penutup ikut (post-roll)
-                self._tutup(ev)
-        if self.writer is not None:
-            self.writer.write(frame)                  # streaming selama aktif
-        self.rolling.add(t, frame)                    # SETELAH -> pre-roll tak dobel frame ini
+                if SKIP_PIPELINE_CLIP:
+                    self._simpan_episode(ev, None)        # jsonl + DB, tanpa video
+                else:
+                    if self.writer is not None:
+                        self.writer.write(frame)          # frame penutup ikut (post-roll)
+                    self._tutup(ev)
+        if not SKIP_PIPELINE_CLIP:
+            if self.writer is not None:
+                self.writer.write(frame)                  # streaming selama aktif
+            self.rolling.add(t, frame)                    # SETELAH -> pre-roll tak dobel frame ini
 
     def flush(self, t):
         for ev in self.scene.flush(t):
-            self._tutup(ev)
+            if SKIP_PIPELINE_CLIP:
+                self._simpan_episode(ev, None)
+            else:
+                self._tutup(ev)
 
     # -- efek samping berkas --
     def _buka(self, t, frame):
@@ -609,17 +625,20 @@ class EpisodeRecorder:
                 os.replace(raw, final)
             except OSError:
                 pass
+        self._simpan_episode(ev, os.path.basename(final))
+
+    def _simpan_episode(self, ev, clip):
+        """jsonl + mirror DB (notif masuk/keluar dari episode; saring 'lewat' & yg cuma
+        jalan-utama). clip=None saat SKIP_PIPELINE_CLIP (bot potong dari segmen)."""
         with open(self.log_path, "a") as f:
-            f.write(json.dumps({**ev, "clip": os.path.basename(final)}) + "\n")
-        # mirror ke DB: notif masuk/keluar dari episode (saring 'lewat' & yg cuma jalan-utama).
-        # clip = episode klip pipeline (fallback bila potong-segmen gagal).
+            f.write(json.dumps({**ev, "clip": clip}) + "\n")
         if self.db:
             gates = ev.get("gates", [])
             layak = ev.get("arah") in ("masuk", "keluar") and any(g != "jalan-utama" for g in gates)
             notify = 1 if (NOTIFY_FROM_EPISODE and layak) else 0
-            self.db.tulis(ts=ev.get("start", 0), kind="episode", clip=os.path.basename(final),
+            self.db.tulis(ts=ev.get("start", 0), kind="episode", clip=clip,
                           notify=notify, payload=dict(ev))
-        print(f"[EPISODE] {ev['arah']} {ev['gates']} -> {os.path.basename(final)}", flush=True)
+        print(f"[EPISODE] {ev['arah']} {ev['gates']} -> {clip or '(tanpa klip)'}", flush=True)
 
     def close(self):
         self.jobs.shutdown(wait=True)
