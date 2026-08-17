@@ -45,6 +45,10 @@ CHAT_ID = os.environ["TG_CHAT_ID"]
 # TG_VIA_BOT=1 -> inti BERHENTI kirim Telegram sendiri; hanya tulis event ke DB,
 # service bot (bot/) yang mengirim + menerapkan arming. Default (unset): perilaku lama.
 TG_VIA_BOT = os.environ.get("TG_VIA_BOT") == "1"
+# NOTIFY_FROM_EPISODE=1 -> notifikasi masuk/keluar DIGERAKKAN oleh EPISODE (occupancy,
+# andal, kebal kedip track) alih-alih transit (rapuh). Transit -> notify=0 (tak dobel);
+# episode masuk/keluar -> notify=1 (saring 'lewat'/jalan-utama). Default: transit seperti biasa.
+NOTIFY_FROM_EPISODE = os.environ.get("NOTIFY_FROM_EPISODE") == "1"
 
 
 def jam(t):
@@ -480,9 +484,12 @@ class ClipRecorder:
         # mirror ke DB (notify=1: layak diberitahu). Ditulis SELALU, apa pun mode kirim,
         # supaya bot bisa melihatnya. arah disimpan di payload (kind/gates) untuk caption bot.
         if self.writer:
+            # transit (masuk/keluar) -> notify=0 saat NOTIFY_FROM_EPISODE (episode yg kabari);
+            # close/loiter tetap notify=1 (alert mandiri).
+            notify_clip = 0 if (NOTIFY_FROM_EPISODE and ev["kind"] in self.TRANSIT_KINDS) else 1
             self.writer.tulis(ts=self._event_time(ev), kind=ev["kind"], zone=ev.get("zone"),
                               species=ev.get("species"), clip=os.path.basename(final_name),
-                              notify=1, payload=ev)
+                              notify=notify_clip, payload=ev)
         if self.tg_via_bot:
             return                               # inti diam; service bot yang mengirim
         # jadwal arming (mode A): senyap -> klip TETAP tersimpan, upload dilewati
@@ -543,10 +550,11 @@ class EpisodeRecorder:
     """
 
     def __init__(self, scene, out_dir="out/live", log_path="episodes-live.jsonl",
-                 pre_s=3.0, fps=20.0):
+                 pre_s=3.0, fps=20.0, writer=None):
         self.scene = scene            # SceneEpisode (otak keputusan)
         self.out_dir = out_dir
         self.log_path = log_path
+        self.writer = writer          # db.EventWriter -> mirror episode ke DB (notif-dari-episode)
         self.pre_s = pre_s            # detik pra-rekam sebelum orang muncul
         self.fps = fps
         self.rolling = FrameBuffer(keep_s=max(6, int(pre_s) + 2))
@@ -602,6 +610,14 @@ class EpisodeRecorder:
                 pass
         with open(self.log_path, "a") as f:
             f.write(json.dumps({**ev, "clip": os.path.basename(final)}) + "\n")
+        # mirror ke DB: notif masuk/keluar dari episode (saring 'lewat' & yg cuma jalan-utama).
+        # clip = episode klip pipeline (fallback bila potong-segmen gagal).
+        if self.writer:
+            gates = ev.get("gates", [])
+            layak = ev.get("arah") in ("masuk", "keluar") and any(g != "jalan-utama" for g in gates)
+            notify = 1 if (NOTIFY_FROM_EPISODE and layak) else 0
+            self.writer.tulis(ts=ev.get("start", 0), kind="episode", clip=os.path.basename(final),
+                              notify=notify, payload=dict(ev))
         print(f"[EPISODE] {ev['arah']} {ev['gates']} -> {os.path.basename(final)}", flush=True)
 
     def close(self):
@@ -757,7 +773,7 @@ def main():
 
         episodes = None if args.no_episode else EpisodeRecorder(
             SceneEpisode(grace_s=args.episode_grace, max_s=args.episode_max),
-            out_dir=args.out_dir, pre_s=args.episode_pre)
+            out_dir=args.out_dir, pre_s=args.episode_pre, writer=writer)
 
         debug = DebugLog(args.debug_toggle, args.debug_dir)
         config = ConfigPoll(args.db, detector, engine, cat_engine)   # config live dari DB (bot)

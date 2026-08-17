@@ -49,8 +49,21 @@ def _transit(ev):
     return f"{lead} {label} {utama}\n{baris2}"
 
 
+def _episode(ev):
+    arah = ev.get("arah")
+    gates = ev.get("gates", [])
+    masuk = arah == "masuk"
+    lead = "🟢" if masuk else "🔴"
+    label = "MASUK" if masuk else "KELUAR"
+    utama = "RUMAH" if "pintu" in gates else "PROPERTY"     # ambang pintu tersentuh = level rumah
+    dur = ev.get("end", ev.get("start", 0)) - ev.get("start", 0)
+    jalur = " → ".join(gates[:5]) if gates else ""
+    return f"{lead} {label} {utama}\n{jam(ev.get('start', 0))} · {dur:.0f}s · {jalur}"
+
+
 def caption(payload):
     match payload.get("kind"):
         case "loiter": return _loiter(payload)
         case "close": return _close(payload)
+        case "episode": return _episode(payload)
         case _: return _transit(payload)     # keluar / masuk

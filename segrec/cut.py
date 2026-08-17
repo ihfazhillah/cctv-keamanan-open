@@ -75,7 +75,7 @@ def cut(seg_dir, t0, t1, out_path, seg_time=4):
 def window_for(payload, pre=4.0, post=6.0):
     """Jendela [t0,t1] untuk event, dari payload (epoch)."""
     kind = payload.get("kind")
-    if kind == "close":
+    if kind in ("close", "episode"):                    # episode = seluruh kunjungan [start,end]
         return payload.get("start", 0) - pre, payload.get("end", payload.get("start", 0)) + post
     if kind == "loiter":
         return payload.get("start", 0) - pre, payload.get("at", payload.get("start", 0)) + post
