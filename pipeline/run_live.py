@@ -406,19 +406,19 @@ class SightingRecorder:
     def __init__(self, writer, cooldown_s=8.0):
         self.writer = writer
         self.cooldown = cooldown_s
-        self.last = {}                     # (kind, tid) -> zona terakhir
+        self.ttl = max(cooldown_s, 30.0)   # lupakan track tak-terlihat > ttl; KEDIP pendek
+                                           # (absen sesaat) TAK menghapus debounce -> tak dobel
+        self.last = {}                     # (kind, tid) -> (zona terakhir, t terlihat terakhir)
         self.emit = {}                     # (kind, tid, zona) -> t emit terakhir (debounce)
 
     def observe(self, t, persons, cats):
         if not self.writer:
             return
-        present = set()
         for kind, mapping in (("orang", persons), ("kucing", cats)):
             for tid, zone in mapping.items():
                 key = (kind, tid)
-                present.add(key)
-                prev = self.last.get(key)
-                self.last[key] = zone
+                prev = self.last.get(key, (None, 0.0))[0]
+                self.last[key] = (zone, t)
                 if not zone or zone == prev or zone in self.ABAI:   # emit hanya saat MASUK zona bernama baru
                     continue
                 ek = (kind, tid, zone)
@@ -428,9 +428,11 @@ class SightingRecorder:
                 sp = "kucing" if kind == "kucing" else None
                 self.writer.tulis(ts=t, kind="lewat", zone=zone, species=sp, notify=1,
                                   payload={"kind": "lewat", "zone": zone, "species": sp, "at": t})
-        for key in [k for k in self.last if k not in present]:      # prune track yg hilang dari frame
+        # prune berbasis UMUR (bukan absen-sesaat): track yg lama tak terlihat -> buang
+        # state-nya; track yg cuma kedip semalam tetap diingat -> cooldown tak reset.
+        for key in [k for k, v in self.last.items() if t - v[1] > self.ttl]:
             self.last.pop(key, None)
-            for ek in [e for e in self.emit if (e[0], e[1]) == key]:
+            for ek in [e for e in self.emit if e[:2] == key]:
                 self.emit.pop(ek, None)
 
 
