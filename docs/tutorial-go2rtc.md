@@ -89,6 +89,40 @@ streams:
 ```
 (Untuk push RTMP, aktifkan `rtmp: { listen: ":1935" }` di config.)
 
+### 5a. USB webcam — cari device node dulu, jangan asal `/dev/video0`
+`/dev/video0` di config itu **tebakan default**. Satu webcam sering bikin >1 node
+(satu video, satu metadata), jadi verifikasi dulu:
+
+```bash
+sudo dnf install v4l-utils        # sekali saja
+ls -l /dev/video*                 # muncul setelah webcam dicolok
+v4l2-ctl --list-devices           # kelompokkan per perangkat; node pertama = capture
+v4l2-ctl -d /dev/video0 --list-formats-ext   # cek format: ada H264 atau cuma MJPG/YUYV?
+```
+- Ada `H264` → pakai config tutorial apa adanya (ringan, tanpa transcode).
+- Cuma `MJPG`/`YUYV` → biarkan ffmpeg encode: `ffmpeg:device?video=/dev/videoN#video=h264`
+  (lepas `#hardware` bila encoder GPU tak tersedia).
+
+Uji cepat device sebelum masuk hub: `ffmpeg -f v4l2 -i /dev/videoN -frames:v 1 /tmp/test.jpg`.
+
+**Alur USB webcam masuk hub (beda dengan RTSP/RTMP yang lewat jaringan):**
+```
+[1] colok USB    [2] kernel bikin      [3] go2rtc panggil   [4] normalkan     [5] konsumen
+    webcam    ─►     /dev/videoN    ─►     ffmpeg baca   ─►   jadi RTSP/    ─► pipeline
+                     (driver V4L2)         device itu         WebRTC di hub    segrec/browser
+```
+1. **Colok fisik** — driver UVC mengenali webcam.
+2. **Device node** — V4L2 bikin `/dev/videoN`; inilah "pintu masuk" kamera.
+3. **go2rtc → ffmpeg** — saat ada konsumen, go2rtc jalankan ffmpeg internal: buka
+   `/dev/videoN` → ambil frame → jadikan H.264 (`#hardware` = pakai encoder GPU bila ada).
+4. **Normalkan** — hasilnya jadi keluaran seragam: `rtsp://localhost:8554/webcam` + WebRTC.
+5. **Konsumen** — pipeline & segrec baca RTSP itu, **tak pernah menyentuh `/dev/videoN`**.
+   Hanya go2rtc yang pegang device → tak ada rebutan.
+
+Bedanya cuma di **langkah masuk**: RTSP = go2rtc menarik via jaringan, RTMP = sumber
+mendorong via jaringan, USB = go2rtc buka **file device lokal**. Langkah [4]–[5] identik
+untuk ketiganya — semua bermuara jadi RTSP keluaran seragam.
+
 ## 6. Jadikan service (systemd --user)
 `~/.config/systemd/user/go2rtc.service`:
 ```ini
