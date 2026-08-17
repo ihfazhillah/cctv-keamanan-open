@@ -460,6 +460,39 @@ def seg_hls(day, hour):
     return "\n".join(lines) + "\n"
 
 
+def seg_locate(ts):
+    """Petakan epoch -> (day, hour, offset) dalam playlist HLS jam itu, agar bisa
+    'buka event di arsip' & lompat ke detiknya. offset = ts - epoch segmen PERTAMA
+    jam itu (timeline HLS mulai dari segmen pertama, bukan HH:00:00). ok:False bila
+    jam tak terarsip (di luar retensi)."""
+    if not SEGREC["ok"]:
+        return {"ok": False, "error": "arsip tak tersedia"}
+    lt = time.localtime(ts)
+    day = time.strftime("%Y%m%d", lt)
+    hour = time.strftime("%H", lt)
+    hd = os.path.join(ROOT, SEGREC["seg_dir"], day, hour)
+    if not os.path.isdir(hd):
+        return {"ok": False, "error": "tak ada arsip untuk waktu itu (di luar retensi?)"}
+    try:
+        eps = [segcut.seg_epoch(os.path.join(hd, n)) for n in os.listdir(hd)
+               if n.startswith("seg_") and n.endswith(".ts")]
+    except OSError:
+        eps = []
+    eps = [e for e in eps if e is not None]
+    if not eps:
+        return {"ok": False, "error": "jam arsip kosong"}
+    offset = max(0.0, ts - min(eps))
+    return {"ok": True, "day": day, "hour": hour, "offset": round(offset, 1)}
+
+
+def seg_locate_from_qs(qs):
+    try:
+        ts = float(qs.get("ts", [""])[0])
+    except (ValueError, IndexError):
+        return {"ok": False, "error": "parameter ts tidak valid"}
+    return seg_locate(ts)
+
+
 # ══ Episode: kelompokkan passage SE-ARAH jadi satu transit ══════════════════════
 # "keluar" nyata = KELUAR rumah -> KELUAR property (satu gerak keluar); "masuk" =
 # MASUK property -> MASUK rumah. Klip tersimpan memotong ini jadi fragmen; episode
@@ -562,6 +595,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(seg_grab_from_qs(qs))
         elif u.path == "/api/seg/hls":
             self._seg_hls(qs)
+        elif u.path == "/api/seg/locate":
+            self._json(seg_locate_from_qs(qs))
         elif u.path.startswith("/seg/ts/"):
             self._seg_ts(u.path[len("/seg/ts/"):])
         elif u.path.startswith("/static/"):
@@ -1098,7 +1133,9 @@ function renderEpDetail(e){
       <dt>Mulai</dt><dd class="mono">${e.when}</dd>
       <dt>Span</dt><dd>${e.dur.toFixed(1)} detik</dd>
       <dt>Passage</dt><dd>${e.kinds.join(" → ")}</dd>
-    </dl></div>`;
+    </dl>
+    ${arsipBtn(e.start)}</div>`;
+  wireArsipBtn(e.start);
 }
 
 // ── tarik footage penuh dari NVR ──
@@ -1203,13 +1240,15 @@ function ensureHls(){
   return _hlsLib;
 }
 function killHls(){ if(curHls){ try{ curHls.destroy(); }catch(e){} curHls = null; } }
-async function playHls(day, hour){
+async function playHls(day, hour, seekTo){
   killHls();
+  seekTo = seekTo > 0 ? seekTo : 0;
   const url = `/api/seg/hls?day=${day}&hour=${hour}`;
+  const seekNote = seekTo ? ` · @${Math.floor(seekTo/60)}m${String(Math.floor(seekTo%60)).padStart(2,"0")}s` : "";
   $("#stage").innerHTML = `
     <div class="screen"><video id="hlsvid" controls autoplay playsinline></video>
       <div class="scan"></div><div class="rec"><span class="b"></span>ARSIP ${hour}:00</div></div>
-    <div class="cap"><span class="fn mono">jam ${hour}:00 · HLS (jam penuh, seek instan)</span>
+    <div class="cap"><span class="fn mono">jam ${hour}:00 · HLS (jam penuh, seek instan)${seekNote}</span>
       <a href="${url}">playlist .m3u8</a></div>`;
   const v = $("#hlsvid");
   // hls.js DULU: Chrome balas canPlayType('...mpegurl')='maybe' padahal tak bisa
@@ -1217,14 +1256,23 @@ async function playHls(day, hour){
   try {
     await ensureHls();
     if(window.Hls && Hls.isSupported()){
-      curHls = new Hls({ maxBufferLength: 30 });
-      curHls.on(Hls.Events.ERROR, (_, d) => { if(d.fatal) $("#segStatus").textContent = "HLS error: " + d.details; });
+      curHls = new Hls({ maxBufferLength: 30, startPosition: seekTo || -1 });
+      curHls.on(Hls.Events.ERROR, (_, d) => { if(d.fatal) $("#segStatus") && ($("#segStatus").textContent = "HLS error: " + d.details); });
       curHls.loadSource(url); curHls.attachMedia(v);
       return;
     }
   } catch(err){ /* jatuh ke native di bawah */ }
-  if(v.canPlayType("application/vnd.apple.mpegurl")){ v.src = url; }          // Safari native
-  else { $("#stage").innerHTML = `<div class="placeholder">HLS tak didukung browser ini.</div>`; }
+  if(v.canPlayType("application/vnd.apple.mpegurl")){                          // Safari native
+    v.src = url;
+    if(seekTo) v.addEventListener("loadedmetadata", () => { v.currentTime = seekTo; }, {once:true});
+  } else { $("#stage").innerHTML = `<div class="placeholder">HLS tak didukung browser ini.</div>`; }
+}
+async function openInArsip(ts){
+  let r;
+  try { r = await (await fetch("/api/seg/locate?ts=" + ts)).json(); }
+  catch(e){ r = {ok:false, error:String(e)}; }
+  if(r.ok){ playHls(r.day, r.hour, r.offset); }
+  else { $("#stage").innerHTML = `<div class="placeholder">Arsip: ${r.error||"tak tersedia"}</div>`; }
 }
 function _hms(t){ const p=(t||"").split(":").map(Number); return (p[0]||0)*3600+(p[1]||0)*60+(p[2]||0); }
 function updateSegRange(){
@@ -1283,6 +1331,10 @@ function renderStage(e, playlistMode){
   }
 }
 
+function arsipBtn(ts){   // tombol 'buka di arsip' bila arsip aktif & event punya jam nyata
+  return (META.segrec && ts > 1e9) ? `<button class="ghost" id="toArsip" style="margin-top:10px">▶ buka di arsip (jam penuh)</button>` : "";
+}
+function wireArsipBtn(ts){ const b = $("#toArsip"); if(b) b.onclick = () => openInArsip(ts); }
 function renderDetail(e){
   $("#detailWrap").innerHTML = `
     <div class="detail">
@@ -1294,7 +1346,9 @@ function renderDetail(e){
         <dt>Subjek</dt><dd>${e.species==="kucing"?"🐈 kucing":"orang"}</dd>
         <dt>Berkas</dt><dd class="mono med">${e.media? e.media.file : "— (tak ada)"}</dd>
       </dl>
+      ${arsipBtn(e.ts)}
     </div>`;
+  wireArsipBtn(e.ts);
 }
 
 // ── putar semua (stream berurutan) ──
