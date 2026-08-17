@@ -56,7 +56,7 @@ CLIP_KINDS = {"close", "loiter"}
 # kinds yang tampil di log Event (mirror events-live.jsonl lama + garasi). Sengaja
 # TAK ikut: 'episode' (mode Episode terpisah, di-derive) & 'keluar'/'masuk' lowercase
 # (transit klip internal).
-LOG_KINDS = ("close", "loiter", "KELUAR rumah", "KELUAR property",
+LOG_KINDS = ("close", "loiter", "lewat", "KELUAR rumah", "KELUAR property",
              "MASUK rumah", "MASUK property", "garasi")
 
 

@@ -44,7 +44,7 @@ HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 # 'segment' (potong dari segmen segrec -> beraudio & mulus; fallback ke pipeline).
 DEFAULTS = {"notif_default": "aktif", "armed": "on",
             "send_close": "on", "send_loiter": "on", "send_transit": "on", "send_kucing": "on",
-            "send_garasi": "on", "clip_source": "pipeline"}
+            "send_garasi": "on", "send_lewat": "off", "clip_source": "pipeline"}
 CAMERAS_FILE = os.environ.get("CAMERAS_FILE", "cameras.json")   # sumber bersama (viewer + run_garasi)
 # kedalaman default (mirror ZONE_DEPTH kode; utk editor zone-depth)
 BUILTIN_DEPTH = {"jalan-masuk": 1, "tangga": 1, "taman": 2, "dekat-kolam": 2, "teras": 2, "pintu": 3}
@@ -118,7 +118,7 @@ def keputusan_kirim(con, ev, default, rules):
     p = ev["payload"]
     if p.get("species") == "kucing" and sget(con, "send_kucing") != "on":
         return "skipped_filter"
-    kat = {"close": "send_close", "loiter": "send_loiter",
+    kat = {"close": "send_close", "loiter": "send_loiter", "lewat": "send_lewat",
            "garasi": "send_garasi"}.get(ev["kind"], "send_transit")
     if sget(con, kat) != "on":
         return "skipped_filter"
@@ -208,8 +208,8 @@ def layar_filter(con):
     txt = "🔧 Filter jenis notifikasi\n(centang = dikirim)"
     kb = types.InlineKeyboardMarkup()
     for key, label in [("send_close", "👤 Singgah (close)"), ("send_loiter", "⏳ Berlama (loiter)"),
-                       ("send_transit", "🚪 Masuk/Keluar"), ("send_kucing", "🐈 Kucing"),
-                       ("send_garasi", "🚗 Garasi")]:
+                       ("send_transit", "🚪 Masuk/Keluar"), ("send_lewat", "👣 Lewat (sekejap)"),
+                       ("send_kucing", "🐈 Kucing"), ("send_garasi", "🚗 Garasi")]:
         on = sget(con, key) == "on"
         kb.row(_tombol(("✅ " if on else "⬜ ") + label, f"flt:{key}"))
     kb.row(_tombol("⬅️ Menu", "nav:menu"))

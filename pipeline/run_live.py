@@ -394,6 +394,46 @@ class DebugLog:
             self.fh.flush()
 
 
+class SightingRecorder:
+    """Catat SETIAP track masuk zona bernama (orang & kucing) sbg event 'lewat' ke DB
+    — WALAU sekejap (orang/kucing lewat cepat di area pintu yg gelap: RuleEngine yg
+    butuh okupansi berkelanjutan tak keluarkan event, tapi kehadiran tetap nyata).
+    REKAM SELALU (notify=1); notifikasi diatur bot (send_lewat, default off). Debounce
+    per (track,zona) supaya jitter anchor tak spam. TERPISAH dari RuleEngine (nol regresi)."""
+
+    ABAI = {"jalan-utama"}                 # jalan umum -> tak dicatat sbg 'lewat'
+
+    def __init__(self, writer, cooldown_s=8.0):
+        self.writer = writer
+        self.cooldown = cooldown_s
+        self.last = {}                     # (kind, tid) -> zona terakhir
+        self.emit = {}                     # (kind, tid, zona) -> t emit terakhir (debounce)
+
+    def observe(self, t, persons, cats):
+        if not self.writer:
+            return
+        present = set()
+        for kind, mapping in (("orang", persons), ("kucing", cats)):
+            for tid, zone in mapping.items():
+                key = (kind, tid)
+                present.add(key)
+                prev = self.last.get(key)
+                self.last[key] = zone
+                if not zone or zone == prev or zone in self.ABAI:   # emit hanya saat MASUK zona bernama baru
+                    continue
+                ek = (kind, tid, zone)
+                if t - self.emit.get(ek, -1e18) < self.cooldown:
+                    continue
+                self.emit[ek] = t
+                sp = "kucing" if kind == "kucing" else None
+                self.writer.tulis(ts=t, kind="lewat", zone=zone, species=sp, notify=1,
+                                  payload={"kind": "lewat", "zone": zone, "species": sp, "at": t})
+        for key in [k for k in self.last if k not in present]:      # prune track yg hilang dari frame
+            self.last.pop(key, None)
+            for ek in [e for e in self.emit if (e[0], e[1]) == key]:
+                self.emit.pop(ek, None)
+
+
 # ══ STAGE 6: perekam klip (konsumen di thread terpisah) ════════════════════════
 class ClipRecorder:
     """Konsumen: pending trigger -> tulis event ke jsonl + bangun klip/snapshot +
@@ -646,7 +686,7 @@ class EpisodeRecorder:
 
 # ══ Orkestrasi: rangkai stage jadi satu loop pipeline ══════════════════════════
 def run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit, q,
-                 debug=None, episodes=None, config=None):
+                 debug=None, episodes=None, config=None, sightings=None):
     frame_no = 0
     last_hb_t = time.time()
     t = last_hb_t
@@ -672,6 +712,9 @@ def run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit
 
             occupied, tid_to_zone = occupancy.of(persons)
             occupied_cat, cat_tid_to_zone = occupancy.of(cats)
+
+            if sightings:
+                sightings.observe(t, tid_to_zone, cat_tid_to_zone)  # catat SETIAP sentuhan zona (walau sekejap)
 
             if episodes:
                 episodes.observe(t, frame, occupied)   # SATU video per episode (zone-driven)
@@ -797,8 +840,12 @@ def main():
 
         debug = DebugLog(args.debug_toggle, args.debug_dir)
         config = ConfigPoll(args.db, detector, engine, cat_engine)   # config live dari DB (bot)
+        # RECORD_SIGHTINGS=1 (default) -> catat SETIAP track masuk zona bernama sbg 'lewat'
+        # ke DB, walau sekejap (RuleEngine butuh okupansi berkelanjutan -> luput). notify=1
+        # tapi bot 'send_lewat' default off -> tercatat tanpa spam Telegram.
+        sightings = None if os.environ.get("RECORD_SIGHTINGS", "1") != "1" else SightingRecorder(writer)
         run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit, q,
-                     debug, episodes, config)
+                     debug, episodes, config, sightings)
         consumer.join()
         recorder.close()          # tuntaskan upload yang masih di antrean
         if episodes:
