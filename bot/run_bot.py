@@ -44,7 +44,8 @@ HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 # 'segment' (potong dari segmen segrec -> beraudio & mulus; fallback ke pipeline).
 DEFAULTS = {"notif_default": "aktif", "armed": "on",
             "send_close": "on", "send_loiter": "on", "send_transit": "on", "send_kucing": "on",
-            "clip_source": "pipeline"}
+            "send_garasi": "on", "clip_source": "pipeline"}
+CAMERAS_FILE = os.environ.get("CAMERAS_FILE", "cameras.json")   # sumber bersama (viewer + run_garasi)
 # kedalaman default (mirror ZONE_DEPTH kode; utk editor zone-depth)
 BUILTIN_DEPTH = {"jalan-masuk": 1, "tangga": 1, "taman": 2, "dekat-kolam": 2, "teras": 2, "pintu": 3}
 
@@ -70,6 +71,45 @@ def zone_names():
         return sorted(BUILTIN_DEPTH)
 
 
+# ── cameras.json (jadwal garasi; dibaca run_garasi live, diedit viewer + bot) ─────
+def _read_cameras():
+    try:
+        return json.loads(open(CAMERAS_FILE).read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"version": 1, "kamera": []}
+
+
+def _garasi_cam(cfg):
+    for k in cfg.get("kamera", []):
+        if k.get("peran") == "garasi-ringan":
+            return k
+    return None
+
+
+def _set_garasi(mut):
+    """mut(cam) mengubah entri garasi in-place lalu simpan. Return cam / None."""
+    cfg = _read_cameras()
+    cam = _garasi_cam(cfg)
+    if cam is None:
+        return None
+    mut(cam)
+    with open(CAMERAS_FILE, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    return cam
+
+
+def _win_label(jadwal):
+    if not jadwal:
+        return "24/7 (selalu aktif)"
+    aktif = [f"{w['from']}–{w['to']}" for w in jadwal if w.get("aktif", True)]
+    return ", ".join(aktif) if aktif else "(tak ada jendela aktif)"
+
+
+WIN_PRESET = {"malam": ("🌙 Malam 22–04", [{"from": "22:00", "to": "04:00", "aktif": True}]),
+              "kerja": ("🏢 Jam kerja 08–17", [{"from": "08:00", "to": "17:00", "aktif": True}]),
+              "full": ("🔁 24/7 (selalu)", [])}
+
+
 # ══ THREAD PENGIRIM ═════════════════════════════════════════════════════════════
 def keputusan_kirim(con, ev, default, rules):
     """Status akhir untuk satu event: 'sent' (boleh) atau alasan skip."""
@@ -78,7 +118,8 @@ def keputusan_kirim(con, ev, default, rules):
     p = ev["payload"]
     if p.get("species") == "kucing" and sget(con, "send_kucing") != "on":
         return "skipped_filter"
-    kat = {"close": "send_close", "loiter": "send_loiter"}.get(ev["kind"], "send_transit")
+    kat = {"close": "send_close", "loiter": "send_loiter",
+           "garasi": "send_garasi"}.get(ev["kind"], "send_transit")
     if sget(con, kat) != "on":
         return "skipped_filter"
     if not arming.notif_aktif(default, rules, arming.tags_of(p), ev["ts"]):
@@ -159,6 +200,7 @@ def layar_menu(con):
            _tombol(("✅ " if default == "senyap" else "") + "🔕 Senyap", "def:senyap"))
     kb.row(_tombol("🔧 Filter jenis", "nav:filter"), _tombol("⚙️ Deteksi", "nav:deteksi"))
     kb.row(_tombol("🗓️ Jadwal", "nav:jadwal"), _tombol("📊 Ringkasan", "nav:ringkasan"))
+    kb.row(_tombol("📷 Garasi", "nav:garasi"))
     return txt, kb
 
 
@@ -166,7 +208,8 @@ def layar_filter(con):
     txt = "🔧 Filter jenis notifikasi\n(centang = dikirim)"
     kb = types.InlineKeyboardMarkup()
     for key, label in [("send_close", "👤 Singgah (close)"), ("send_loiter", "⏳ Berlama (loiter)"),
-                       ("send_transit", "🚪 Masuk/Keluar"), ("send_kucing", "🐈 Kucing")]:
+                       ("send_transit", "🚪 Masuk/Keluar"), ("send_kucing", "🐈 Kucing"),
+                       ("send_garasi", "🚗 Garasi")]:
         on = sget(con, key) == "on"
         kb.row(_tombol(("✅ " if on else "⬜ ") + label, f"flt:{key}"))
     kb.row(_tombol("⬅️ Menu", "nav:menu"))
@@ -217,6 +260,29 @@ def layar_jadwal(con):
     return txt, kb
 
 
+def layar_garasi(con):
+    cfg = _read_cameras()
+    cam = _garasi_cam(cfg)
+    if cam is None:
+        kb = types.InlineKeyboardMarkup()
+        kb.row(_tombol("⬅️ Menu", "nav:menu"))
+        return "📷 Garasi\n\nKamera peran 'garasi-ringan' belum ada di cameras.json.", kb
+    en = cam.get("enabled", True)
+    gsend = sget(con, "send_garasi") == "on"
+    txt = ("📷 Deteksi garasi (ringan)\n\n"
+           f"Deteksi: {'🟢 ON' if en else '⭕ OFF'}\n"
+           f"Notif garasi: {'🔔 aktif' if gsend else '🔕 senyap'}\n"
+           f"Jendela: {_win_label(cam.get('jadwal', []))}\n\n"
+           "Di luar jendela: proses hidup, tak inferensi/notif (hemat GPU). Berlaku live.")
+    kb = types.InlineKeyboardMarkup()
+    kb.row(_tombol(f"🛡️ {'Matikan' if en else 'Nyalakan'} deteksi", "gar:toggle"))
+    kb.row(_tombol(("🔕 Bungkam notif" if gsend else "🔔 Aktifkan notif"), "garsend"))
+    for key, (label, _) in WIN_PRESET.items():
+        kb.row(_tombol(label, f"garwin:{key}"))
+    kb.row(_tombol("⬅️ Menu", "nav:menu"))
+    return txt, kb
+
+
 PERIODE = {"hari": ("Hari ini", None), "24j": ("24 jam", 24 * 3600), "7h": ("7 hari", 7 * 24 * 3600)}
 
 
@@ -256,7 +322,7 @@ def layar_ringkasan(con, key="24j"):
 
 
 LAYAR = {"menu": layar_menu, "filter": layar_filter, "deteksi": layar_deteksi,
-         "zdepth": layar_zdepth, "jadwal": layar_jadwal}
+         "zdepth": layar_zdepth, "jadwal": layar_jadwal, "garasi": layar_garasi}
 
 
 def tampil(con, chat_id, message_id, nama, **kw):
@@ -310,6 +376,17 @@ def on_callback(c):
             k = data.split(":", 1)[1]
             db.set_setting(con, k, "off" if sget(con, k) == "on" else "on")
             tampil(con, chat, mid, "filter"); bot.answer_callback_query(c.id)
+        elif data == "garsend":
+            db.set_setting(con, "send_garasi", "off" if sget(con, "send_garasi") == "on" else "on")
+            tampil(con, chat, mid, "garasi"); bot.answer_callback_query(c.id, "OK")
+        elif data == "gar:toggle":
+            ok = _set_garasi(lambda k: k.update(enabled=not k.get("enabled", True)))
+            tampil(con, chat, mid, "garasi"); bot.answer_callback_query(c.id, "OK" if ok else "garasi tak ada")
+        elif data.startswith("garwin:"):
+            preset = WIN_PRESET.get(data.split(":", 1)[1])
+            if preset is not None:
+                _set_garasi(lambda k: k.update(jadwal=[dict(w) for w in preset[1]]))
+            tampil(con, chat, mid, "garasi"); bot.answer_callback_query(c.id, "OK")
         elif data.startswith("ring:"):
             tampil(con, chat, mid, "ringkasan", key=data.split(":", 1)[1]); bot.answer_callback_query(c.id)
         elif data.startswith("zd:"):
