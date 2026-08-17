@@ -938,6 +938,18 @@ INDEX_HTML = r"""<!doctype html>
   .stage .cap a { margin-left:auto; color:var(--accent); text-decoration:none; font-weight:600; font-size:12.5px; white-space:nowrap; }
   .stage .cap a:hover { text-decoration:underline; }
 
+  /* Live: grid semua kamera (gaya video-call). Klik ⛶ -> layar penuh 1 kamera. */
+  .stage.livewrap { background:transparent; border:0; box-shadow:none; overflow:visible; }
+  .livegrid { display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(300px,1fr)); }
+  .livetile { position:relative; aspect-ratio:16/9; background:var(--screen); border:1px solid var(--line); border-radius:10px; overflow:hidden; box-shadow:var(--shadow); }
+  .livetile iframe { width:100%; height:100%; border:0; display:block; background:var(--screen); }
+  .livetile .livetag { position:absolute; top:8px; left:10px; display:flex; align-items:center; gap:6px; font-size:12px; font-weight:650; color:#fff; text-shadow:0 1px 2px #000; z-index:2; pointer-events:none; }
+  .livetile .livetag .b { width:8px; height:8px; border-radius:50%; background:var(--ev-exit); box-shadow:0 0 0 3px rgba(232,116,107,.3); }
+  .livetile .fsbtn { position:absolute; top:6px; right:8px; z-index:3; background:rgba(0,0,0,.5); color:#fff; border:0; border-radius:7px; padding:5px 10px; cursor:pointer; font-size:14px; line-height:1; }
+  .livetile .fsbtn:hover { background:rgba(0,0,0,.78); }
+  .livetile:fullscreen { border:0; border-radius:0; }
+  .livetile:fullscreen iframe { object-fit:contain; }
+
   .detail { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; box-shadow:var(--shadow); }
   .detail h2 { margin:0 0 10px; font-size:15px; display:flex; align-items:center; gap:9px; }
   .kv { display:grid; grid-template-columns:110px 1fr; gap:7px 14px; margin:0; }
@@ -1174,15 +1186,16 @@ function segRow(e){
 
 function render(){
   const list = visible();
+  $("#kShown").textContent = list.length;
+  $("#count").textContent = list.length + (MODE==="episode" ? " episode" : MODE==="arsip" ? " jam" : MODE==="live" ? " kamera" : " hasil");
+  if(MODE==="live"){ renderLiveGrid(list); return; }        // gaya video-call, bukan tabel
   const tb = $("#rows"); tb.innerHTML = "";
   $("#noRows").hidden = list.length > 0;
-  $("#count").textContent = list.length + (MODE==="episode" ? " episode" : MODE==="arsip" ? " jam" : MODE==="live" ? " kamera" : " hasil");
-  $("#kShown").textContent = list.length;
   for(const e of list){
     const tr = document.createElement("tr");
     tr.tabIndex = 0;
     tr.setAttribute("aria-selected", e.id===selId ? "true" : "false");
-    tr.innerHTML = MODE==="episode" ? epRow(e) : MODE==="arsip" ? segRow(e) : MODE==="live" ? liveRow(e) : evRow(e);
+    tr.innerHTML = MODE==="episode" ? epRow(e) : MODE==="arsip" ? segRow(e) : evRow(e);
     const pick = () => select(e.id);
     tr.onclick = pick;
     tr.onkeydown = ev => { if(ev.key==="Enter"||ev.key===" "){ ev.preventDefault(); pick(); } };
@@ -1200,10 +1213,7 @@ function select(id, playlistMode){
   const trs = $("#rows").children;
   if(idx>=0 && trs[idx]){ trs[idx].setAttribute("aria-selected","true"); trs[idx].scrollIntoView({block:"nearest"}); }
   const e = byId(id);
-  if(MODE==="live"){
-    SELE = e; $("#detailWrap").innerHTML = ""; $("#nvrWrap").innerHTML = "";
-    renderLiveStage(e.name);
-  } else if(MODE==="arsip"){
+  if(MODE==="arsip"){
     SELE = e; $("#nvrWrap").innerHTML = "";
     renderSegStage(e);
   } else if(MODE==="episode"){
@@ -1303,7 +1313,7 @@ async function grabNvr(){
   btn.disabled = false;
 }
 
-// ── live: tampil stream go2rtc langsung (WebRTC/MSE via iframe go2rtc) ──
+// ── live: GRID semua kamera go2rtc (gaya video-call). klik ⛶ -> layar penuh. ──
 function g2base(){ return `http://${location.hostname}:1984`; }   // go2rtc di host yg sama, port 1984
 async function fetchLive(){
   let streams = [];
@@ -1311,18 +1321,18 @@ async function fetchLive(){
   ALL = streams.map((n, i) => ({ id: i, name: n, when: n }));
   render();
 }
-function liveRow(e){
-  return `<td><span class="tag k-exit">● LIVE</span></td>
-    <td class="mono">${e.name}</td><td></td><td></td><td></td>`;
-}
-function renderLiveStage(name){
-  killHls();
-  const url = `${g2base()}/stream.html?src=${encodeURIComponent(name)}`;
-  $("#stage").innerHTML = `
-    <div class="screen"><iframe src="${url}" style="width:100%;height:100%;border:0" allow="autoplay; fullscreen"></iframe>
-      <div class="rec" style="z-index:3"><span class="b"></span>LIVE · ${name}</div></div>
-    <div class="cap"><span class="fn mono">go2rtc live · ${name}</span>
-      <a href="${url}" target="_blank">buka penuh ↗</a></div>`;
+function renderLiveGrid(list){
+  const g2 = g2base();
+  if(!list.length){ $("#stage").innerHTML = `<div class="placeholder">tak ada stream go2rtc (pastikan go2rtc jalan)</div>`; return; }
+  $("#stage").innerHTML = `<div class="livegrid">${list.map(e => `
+    <div class="livetile" data-name="${e.name}">
+      <iframe src="${g2}/stream.html?src=${encodeURIComponent(e.name)}" allow="autoplay; fullscreen"></iframe>
+      <div class="livetag"><span class="b"></span>${e.name}</div>
+      <button class="fsbtn" title="Layar penuh ${e.name}">⛶</button>
+    </div>`).join("")}</div>`;
+  $("#stage").querySelectorAll(".livetile").forEach(t => {
+    t.querySelector(".fsbtn").onclick = () => { if(t.requestFullscreen) t.requestFullscreen(); };
+  });
 }
 
 // ── arsip segrec: potong rentang waktu dari segmen ──
@@ -1522,6 +1532,8 @@ function setMode(m){
   ths[3].textContent = (m==="arsip" || m==="live") ? "" : "Durasi";
   ths[4].textContent = m==="episode" ? "#" : "";
   $("#playAll").hidden = m!=="event";
+  $("#stage").className = m==="live" ? "stage livewrap" : "stage";      // grid live = tanpa bingkai kartu
+  document.querySelector(".log").hidden = (m==="live");                  // live pakai grid, bukan tabel
   selId = null; SELE = null; killHls();
   $("#detailWrap").innerHTML = ""; $("#nvrWrap").innerHTML = "";
   const label = m==="episode" ? "episode" : m==="arsip" ? "jam arsip" : m==="live" ? "kamera live" : "event";
