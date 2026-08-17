@@ -531,6 +531,22 @@ def seg_locate_from_qs(qs):
     return seg_locate(camera, ts)
 
 
+def seg_grab_at_from_qs(qs):
+    """Potong klip di SEKITAR sebuah epoch event (akurat-wallclock via segcut) — untuk
+    'buka di arsip'. Ganti seek-HLS yg drift (timeline EXTINF != wallclock saat ada
+    frame-drop/gap). pre/post = padding detik sebelum/sesudah event."""
+    camera = qs.get("camera", ["taman"])[0] or "taman"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", camera):
+        return {"ok": False, "error": "camera tidak valid"}
+    try:
+        ts = float(qs.get("ts", [""])[0])
+        pre = float(qs.get("pre", ["6"])[0])
+        post = float(qs.get("post", ["10"])[0])
+    except (ValueError, IndexError):
+        return {"ok": False, "error": "parameter ts/pre/post tidak valid"}
+    return seg_grab(camera, ts - pre, ts + post)
+
+
 # ══ Episode: kelompokkan passage SE-ARAH jadi satu transit ══════════════════════
 # "keluar" nyata = KELUAR rumah -> KELUAR property (satu gerak keluar); "masuk" =
 # MASUK property -> MASUK rumah. Klip tersimpan memotong ini jadi fragmen; episode
@@ -693,6 +709,8 @@ class Handler(BaseHTTPRequestHandler):
             self._seg_hls(qs)
         elif u.path == "/api/seg/locate":
             self._json(seg_locate_from_qs(qs))
+        elif u.path == "/api/seg/clipat":
+            self._json(seg_grab_at_from_qs(qs))
         elif u.path.startswith("/seg/ts/"):
             self._seg_ts(u.path[len("/seg/ts/"):])
         elif u.path.startswith("/static/"):
@@ -1453,10 +1471,13 @@ async function playHls(camera, day, hour, seekTo){
 }
 async function openInArsip(ts, camera){
   camera = camera || "taman";
+  killHls();
+  $("#stage").innerHTML = `<div class="placeholder"><span class="spinner"></span> memotong arsip ${camera}…</div>`;
   let r;
-  try { r = await (await fetch(`/api/seg/locate?camera=${encodeURIComponent(camera)}&ts=${ts}`)).json(); }
+  // potong klip akurat-wallclock di sekitar event (bukan seek-HLS yg drift) -> momen tepat
+  try { r = await (await fetch(`/api/seg/clipat?camera=${encodeURIComponent(camera)}&ts=${ts}`)).json(); }
   catch(e){ r = {ok:false, error:String(e)}; }
-  if(r.ok){ playHls(r.camera, r.day, r.hour, r.offset); }
+  if(r.ok){ playUrl(r.url, r.file, "ARSIP " + camera); }
   else { $("#stage").innerHTML = `<div class="placeholder">Arsip (${camera}): ${r.error||"tak tersedia"}</div>`; }
 }
 function _hms(t){ const p=(t||"").split(":").map(Number); return (p[0]||0)*3600+(p[1]||0)*60+(p[2]||0); }
