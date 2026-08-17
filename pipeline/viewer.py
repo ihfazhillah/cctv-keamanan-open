@@ -39,6 +39,8 @@ try:
 except Exception:                   # arsip jadi non-aktif kalau modul tak ada
     segcut = None
 
+mimetypes.add_type("video/mp2t", ".ts")   # segmen segrec (default tebak salah)
+
 # diisi di main()
 ROOT = "."
 EVENTS_PATH = "events-live.jsonl"
@@ -337,7 +339,8 @@ def nvr_grab_from_qs(qs):
 # segrec merekam A/V utuh -> out/segments/YYYYMMDD/HH/seg_*.ts. Fitur ini menjadikan
 # arsip itu bisa ditelusuri seperti NVR: pilih tanggal->jam->rentang, potong on-demand
 # via segrec/cut.py (-c copy, langsung playable+seekable), sajikan lewat _serve().
-SEGREC = {"seg_dir": "out/segments", "clip_dir": "out/segclip", "max_s": 300, "ok": False}
+SEGREC = {"seg_dir": "out/segments", "clip_dir": "out/segclip", "max_s": 300,
+          "seg_time": 4, "ok": False}
 
 
 def load_segrec(root, seg_dir, clip_dir, max_s):
@@ -425,6 +428,36 @@ def seg_grab_from_qs(qs):
     except (ValueError, IndexError):
         return {"ok": False, "error": "format waktu tidak valid (HH:MM:SS)"}
     return seg_grab(start, end)
+
+
+def seg_hls(day, hour):
+    """Playlist HLS VOD utk satu jam: menunjuk seg_*.ts LANGSUNG (tanpa re-mux) ->
+    putar jam penuh + seek instan di browser (via hls.js). Segmen segrec sudah
+    MPEG-TS h264+AAC = segmen HLS apa adanya. EXTINF nominal seg_time; jeda (segrec
+    restart) -> #EXT-X-DISCONTINUITY. Kembalikan teks m3u8 atau None."""
+    if not SEGREC["ok"]:
+        return None
+    hd = os.path.join(ROOT, SEGREC["seg_dir"], day, hour)
+    if not os.path.isdir(hd):
+        return None
+    try:
+        names = sorted(n for n in os.listdir(hd) if n.startswith("seg_") and n.endswith(".ts"))
+    except OSError:
+        return None
+    if not names:
+        return None
+    seg_time = SEGREC["seg_time"]
+    eps = [segcut.seg_epoch(os.path.join(hd, n)) for n in names]
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3",
+             f"#EXT-X-TARGETDURATION:{int(seg_time) + 1}",
+             "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD"]
+    for i, n in enumerate(names):
+        if i and eps[i] is not None and eps[i - 1] is not None and (eps[i] - eps[i - 1]) > seg_time * 1.5:
+            lines.append("#EXT-X-DISCONTINUITY")           # jeda rekaman -> reset timeline decoder
+        lines.append(f"#EXTINF:{float(seg_time):.3f},")
+        lines.append(f"/seg/ts/{day}/{hour}/{quote(n)}")
+    lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines) + "\n"
 
 
 # ══ Episode: kelompokkan passage SE-ARAH jadi satu transit ══════════════════════
@@ -527,6 +560,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(seg_index())
         elif u.path == "/api/seg/clip":
             self._json(seg_grab_from_qs(qs))
+        elif u.path == "/api/seg/hls":
+            self._seg_hls(qs)
+        elif u.path.startswith("/seg/ts/"):
+            self._seg_ts(u.path[len("/seg/ts/"):])
+        elif u.path.startswith("/static/"):
+            self._serve(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"),
+                        u.path[len("/static/"):])
         elif u.path.startswith("/media/"):
             self._serve(os.path.join(ROOT, MEDIA_DIR), u.path[len("/media/"):],
                         download=(qs.get("download", ["0"])[0] == "1"))
@@ -563,7 +603,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve(self, base_dir, name, download=False):
         name = os.path.basename(unquote(name))   # cegah path traversal
-        path = os.path.join(base_dir, name)
+        self._serve_path(os.path.join(base_dir, name), name, download)
+
+    def _serve_path(self, path, name, download=False):
         if not os.path.isfile(path):
             self.send_error(404)
             return
@@ -606,6 +648,36 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     break
                 remaining -= len(chunk)
+
+    def _seg_hls(self, qs):
+        day = qs.get("day", [""])[0]; hour = qs.get("hour", [""])[0]
+        if not (re.fullmatch(r"\d{8}", day or "") and re.fullmatch(r"\d{2}", hour or "")):
+            self.send_error(400)
+            return
+        pl = seg_hls(day, hour)
+        if not pl:
+            self.send_error(404)
+            return
+        body = pl.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _seg_ts(self, sub):
+        parts = unquote(sub).split("/")
+        if len(parts) != 3:
+            self.send_error(404)
+            return
+        day, hour, name = parts
+        name = os.path.basename(name)
+        if not (re.fullmatch(r"\d{8}", day) and re.fullmatch(r"\d{2}", hour)
+                and re.fullmatch(r"seg_\d{8}_\d{6}\.ts", name)):
+            self.send_error(404)
+            return
+        self._serve_path(os.path.join(ROOT, SEGREC["seg_dir"], day, hour, name), name)
 
     do_HEAD = do_GET
 
@@ -1059,6 +1131,7 @@ function updateRange(){
   $("#nvrRange").textContent = `${fmt(start)} – ${fmt(end)}  (${(end-start).toFixed(1)}s)`;
 }
 function playUrl(url, file, tag){
+  killHls();
   $("#stage").innerHTML = `
     <div class="screen"><video controls autoplay playsinline src="${url}"></video>
       <div class="scan"></div><div class="rec"><span class="b"></span>${tag||"NVR"}</div></div>
@@ -1107,12 +1180,51 @@ function renderSegStage(e){
       <label>sampai <input id="segEnd" type="time" step="1" value="${e.hour}:00:30" style="width:118px"></label>
       <span class="note mono" id="segRange"></span>
     </div>
-    <div class="nvract"><button id="segPlay">▶ Putar rentang</button><span class="note" id="segStatus"></span></div>
+    <div class="nvract"><button id="segHls">▶ Putar 1 jam (HLS)</button>
+      <button id="segPlay" class="ghost">✂ potong rentang</button>
+      <span class="note" id="segStatus"></span></div>
     <div id="segResult"></div></div>`;
   $("#segStart").oninput = updateSegRange;
   $("#segEnd").oninput = updateSegRange;
+  $("#segHls").onclick = () => playHls(SELE.day, SELE.hour);
   $("#segPlay").onclick = grabSeg;
   updateSegRange();
+}
+let _hlsLib = null, curHls = null;
+function ensureHls(){
+  if(_hlsLib) return _hlsLib;
+  _hlsLib = new Promise((res, rej) => {
+    if(window.Hls){ res(); return; }
+    const s = document.createElement("script");
+    s.src = "/static/hls.light.min.js";
+    s.onload = () => res(); s.onerror = () => rej(new Error("gagal muat hls.js"));
+    document.head.appendChild(s);
+  });
+  return _hlsLib;
+}
+function killHls(){ if(curHls){ try{ curHls.destroy(); }catch(e){} curHls = null; } }
+async function playHls(day, hour){
+  killHls();
+  const url = `/api/seg/hls?day=${day}&hour=${hour}`;
+  $("#stage").innerHTML = `
+    <div class="screen"><video id="hlsvid" controls autoplay playsinline></video>
+      <div class="scan"></div><div class="rec"><span class="b"></span>ARSIP ${hour}:00</div></div>
+    <div class="cap"><span class="fn mono">jam ${hour}:00 · HLS (jam penuh, seek instan)</span>
+      <a href="${url}">playlist .m3u8</a></div>`;
+  const v = $("#hlsvid");
+  // hls.js DULU: Chrome balas canPlayType('...mpegurl')='maybe' padahal tak bisa
+  // putar HLS native -> jangan percaya; native hanya untuk Safari (isSupported=false).
+  try {
+    await ensureHls();
+    if(window.Hls && Hls.isSupported()){
+      curHls = new Hls({ maxBufferLength: 30 });
+      curHls.on(Hls.Events.ERROR, (_, d) => { if(d.fatal) $("#segStatus").textContent = "HLS error: " + d.details; });
+      curHls.loadSource(url); curHls.attachMedia(v);
+      return;
+    }
+  } catch(err){ /* jatuh ke native di bawah */ }
+  if(v.canPlayType("application/vnd.apple.mpegurl")){ v.src = url; }          // Safari native
+  else { $("#stage").innerHTML = `<div class="placeholder">HLS tak didukung browser ini.</div>`; }
 }
 function _hms(t){ const p=(t||"").split(":").map(Number); return (p[0]||0)*3600+(p[1]||0)*60+(p[2]||0); }
 function updateSegRange(){
@@ -1228,7 +1340,7 @@ function setMode(m){
   ths[3].textContent = m==="arsip" ? "" : "Durasi";
   ths[4].textContent = m==="episode" ? "#" : "";
   $("#playAll").hidden = m!=="event";
-  selId = null; SELE = null;
+  selId = null; SELE = null; killHls();
   $("#detailWrap").innerHTML = ""; $("#nvrWrap").innerHTML = "";
   const label = m==="episode" ? "episode" : m==="arsip" ? "jam arsip" : "event";
   $("#stage").innerHTML = `<div class="placeholder">pilih sebuah ${label}…</div>`;
