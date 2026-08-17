@@ -1,0 +1,8 @@
+[Unit]
+Description=CCTV retensi out/segclip (cache potongan arsip; size-based, reuse retensi_live.py)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Dev/cctv-keamanan-open
+ExecStart=%h/.local/bin/uv run --env-file .env pipeline/retensi_live.py --dir out/segclip --cap-gb 2 --keep 50
+Environment=PYTHONUNBUFFERED=1

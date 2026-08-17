@@ -1,0 +1,10 @@
+[Unit]
+Description=Jalankan retensi out/segclip tiap jam (cache potongan arsip mudah dibuat ulang)
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
