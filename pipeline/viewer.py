@@ -1585,6 +1585,7 @@ function jadwalRow(w){
 function camRow(k){
   k = k || {nama:"", stream:"", peran:"garasi-ringan", enabled:true, jadwal:[]};
   const div = document.createElement("div");
+  div._orig = k;                 // simpan field lain (zone_file/model/conf/loiter_s) -> jangan hilang saat simpan
   div.className = "camitem";
   div.innerHTML = `
     <div class="rule" style="grid-template-columns:1fr 1fr 128px 66px 32px">
@@ -1618,6 +1619,7 @@ async function openCam(){
 }
 function collectCam(){
   const kamera = [...$("#camList").children].map(div => ({
+    ...(div._orig || {}),          // pertahankan field taman (zone_file/model/conf/loiter_s)
     nama: div.querySelector(".cnama").value.trim(),
     stream: div.querySelector(".cstream").value.trim(),
     peran: div.querySelector(".cperan").value,
