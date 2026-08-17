@@ -1008,6 +1008,7 @@ INDEX_HTML = r"""<!doctype html>
         <button data-m="event" aria-selected="true">Event</button>
         <button data-m="episode" aria-selected="false">Episode</button>
         <button data-m="arsip" aria-selected="false">Arsip</button>
+        <button data-m="live" aria-selected="false">Live</button>
       </div>
       <div class="search">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
@@ -1142,6 +1143,10 @@ function visible(){
       return true;
     });
   }
+  if(MODE==="live"){
+    const q = $("#q").value.trim().toLowerCase();
+    return ALL.filter(e => !q || e.name.toLowerCase().includes(q));
+  }
   if(!activeKinds.size) return ALL;
   return ALL.filter(e => activeKinds.has(family(e.kind)));
 }
@@ -1171,13 +1176,13 @@ function render(){
   const list = visible();
   const tb = $("#rows"); tb.innerHTML = "";
   $("#noRows").hidden = list.length > 0;
-  $("#count").textContent = list.length + (MODE==="episode" ? " episode" : MODE==="arsip" ? " jam" : " hasil");
+  $("#count").textContent = list.length + (MODE==="episode" ? " episode" : MODE==="arsip" ? " jam" : MODE==="live" ? " kamera" : " hasil");
   $("#kShown").textContent = list.length;
   for(const e of list){
     const tr = document.createElement("tr");
     tr.tabIndex = 0;
     tr.setAttribute("aria-selected", e.id===selId ? "true" : "false");
-    tr.innerHTML = MODE==="episode" ? epRow(e) : MODE==="arsip" ? segRow(e) : evRow(e);
+    tr.innerHTML = MODE==="episode" ? epRow(e) : MODE==="arsip" ? segRow(e) : MODE==="live" ? liveRow(e) : evRow(e);
     const pick = () => select(e.id);
     tr.onclick = pick;
     tr.onkeydown = ev => { if(ev.key==="Enter"||ev.key===" "){ ev.preventDefault(); pick(); } };
@@ -1195,7 +1200,10 @@ function select(id, playlistMode){
   const trs = $("#rows").children;
   if(idx>=0 && trs[idx]){ trs[idx].setAttribute("aria-selected","true"); trs[idx].scrollIntoView({block:"nearest"}); }
   const e = byId(id);
-  if(MODE==="arsip"){
+  if(MODE==="live"){
+    SELE = e; $("#detailWrap").innerHTML = ""; $("#nvrWrap").innerHTML = "";
+    renderLiveStage(e.name);
+  } else if(MODE==="arsip"){
     SELE = e; $("#nvrWrap").innerHTML = "";
     renderSegStage(e);
   } else if(MODE==="episode"){
@@ -1293,6 +1301,28 @@ async function grabNvr(){
     }
   } catch(err){ st.textContent = "error: " + err; }
   btn.disabled = false;
+}
+
+// ── live: tampil stream go2rtc langsung (WebRTC/MSE via iframe go2rtc) ──
+function g2base(){ return `http://${location.hostname}:1984`; }   // go2rtc di host yg sama, port 1984
+async function fetchLive(){
+  let streams = [];
+  try { streams = (await (await fetch("/api/streams")).json()).streams || []; } catch(e){}
+  ALL = streams.map((n, i) => ({ id: i, name: n, when: n }));
+  render();
+}
+function liveRow(e){
+  return `<td><span class="tag k-exit">● LIVE</span></td>
+    <td class="mono">${e.name}</td><td></td><td></td><td></td>`;
+}
+function renderLiveStage(name){
+  killHls();
+  const url = `${g2base()}/stream.html?src=${encodeURIComponent(name)}`;
+  $("#stage").innerHTML = `
+    <div class="screen"><iframe src="${url}" style="width:100%;height:100%;border:0" allow="autoplay; fullscreen"></iframe>
+      <div class="rec" style="z-index:3"><span class="b"></span>LIVE · ${name}</div></div>
+    <div class="cap"><span class="fn mono">go2rtc live · ${name}</span>
+      <a href="${url}" target="_blank">buka penuh ↗</a></div>`;
 }
 
 // ── arsip segrec: potong rentang waktu dari segmen ──
@@ -1476,7 +1506,7 @@ async function fetchEpisodes(){
   ALL = await (await fetch("/api/episodes?gap=" + gap)).json();
   render();
 }
-function fetchData(){ return MODE==="episode" ? fetchEpisodes() : MODE==="arsip" ? fetchSegIndex() : fetchEvents(); }
+function fetchData(){ return MODE==="episode" ? fetchEpisodes() : MODE==="arsip" ? fetchSegIndex() : MODE==="live" ? fetchLive() : fetchEvents(); }
 function refresh(){ return MODE==="event" ? fetchEvents() : render(); }
 
 function setMode(m){
@@ -1486,15 +1516,15 @@ function setMode(m){
   document.querySelectorAll(".eventOnly").forEach(x => x.hidden = m!=="event");
   document.querySelectorAll(".episodeOnly").forEach(x => x.hidden = m!=="episode");
   const ths = document.querySelectorAll("thead th");
-  ths[0].textContent = m==="arsip" ? "Tanggal" : "Waktu";
-  ths[1].textContent = m==="episode" ? "Arah" : m==="arsip" ? "Jam" : "Jenis";
-  ths[2].textContent = m==="episode" ? "Gerbang" : m==="arsip" ? "Segmen" : "Zona";
-  ths[3].textContent = m==="arsip" ? "" : "Durasi";
+  ths[0].textContent = m==="arsip" ? "Tanggal" : m==="live" ? "" : "Waktu";
+  ths[1].textContent = m==="episode" ? "Arah" : m==="arsip" ? "Jam" : m==="live" ? "Kamera" : "Jenis";
+  ths[2].textContent = m==="episode" ? "Gerbang" : m==="arsip" ? "Segmen" : m==="live" ? "" : "Zona";
+  ths[3].textContent = (m==="arsip" || m==="live") ? "" : "Durasi";
   ths[4].textContent = m==="episode" ? "#" : "";
   $("#playAll").hidden = m!=="event";
   selId = null; SELE = null; killHls();
   $("#detailWrap").innerHTML = ""; $("#nvrWrap").innerHTML = "";
-  const label = m==="episode" ? "episode" : m==="arsip" ? "jam arsip" : "event";
+  const label = m==="episode" ? "episode" : m==="arsip" ? "jam arsip" : m==="live" ? "kamera live" : "event";
   $("#stage").innerHTML = `<div class="placeholder">pilih sebuah ${label}…</div>`;
   $("#queueWrap").hidden = true;
   fetchData();
