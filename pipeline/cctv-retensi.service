@@ -1,0 +1,8 @@
+[Unit]
+Description=CCTV retensi out/live (arsip klip+snap event bergulir, size-based)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Dev/cctv-keamanan-open
+ExecStart=%h/.local/bin/uv run --env-file .env pipeline/retensi_live.py
+Environment=PYTHONUNBUFFERED=1

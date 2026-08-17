@@ -1,0 +1,10 @@
+[Unit]
+Description=Jalankan retensi out/live tiap hari (jaga <= OUT_LIVE_MAX_GB)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
