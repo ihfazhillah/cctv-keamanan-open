@@ -101,6 +101,18 @@ def main():
         {"kind": "episode", "start": 5.0, "end": 5.0, "arah": "lewat", "gates": ["taman"], "zona": ["taman"]},
     ]))
 
+    # E9) KELUAR via PUNCAK: teras -> pintu (ambang) -> taman. Titik-ujung
+    #     se-kedalaman (teras=taman=2) tapi sempat menyentuh pintu=3 -> KELUAR,
+    #     bukan 'lewat'. Regresi bug notif keluar-rumah luput (#2588).
+    out = run([(0.0, {"teras"}), (1.0, {"pintu"}), (2.0, {"taman"}),
+               (3.0, {}), (6.0, {})])
+    results.append(check("E9 teras->pintu->taman: episode KELUAR (via puncak)", out, [
+        {"kind": "episode_mulai", "at": 0.0},
+        {"kind": "episode", "start": 0.0, "end": 2.0, "arah": "keluar",
+         "gates": ["teras", "pintu", "taman"],
+         "zona": ["pintu", "taman", "teras"]},
+    ]))
+
     print()
     if all(results):
         print(f"ALL PASS ({len(results)}/{len(results)})")

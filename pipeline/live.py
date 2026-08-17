@@ -585,8 +585,19 @@ class SceneEpisode:
     def _arah(self):
         if len(self.order) < 2:
             return "lewat"
-        awal, akhir = depth_of(self.order[0]), depth_of(self.order[-1])
-        return "masuk" if akhir > awal else "keluar" if akhir < awal else "lewat"
+        depths = [depth_of(z) for z in self.order]
+        awal, akhir, puncak = depths[0], depths[-1], max(depths)
+        if akhir > awal:
+            return "masuk"
+        if akhir < awal:
+            return "keluar"
+        # Titik-ujung se-kedalaman: pakai PUNCAK. Menyentuh lapis lebih dalam
+        # (mis. ambang pintu) lalu kembali ke zona baru sekedalaman awal =
+        # sempat ke ambang rumah lalu keluar lagi -> KELUAR (jangan telan jadi
+        # 'lewat'; inilah kasus keluar-rumah yg tadinya luput dari notif).
+        if puncak > awal:
+            return "keluar"
+        return "lewat"
 
 
 def _hhmm(s):
