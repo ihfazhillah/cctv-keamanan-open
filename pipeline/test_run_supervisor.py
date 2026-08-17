@@ -27,7 +27,9 @@ def test_desired_satu_taman_satu_garasi():
         {"nama": "gudang", "stream": "gudang", "peran": "garasi-ringan", "enabled": True},
     ]}
     d = desired_procs(cfg, "cameras.json")
-    assert set(d) == {("live", "taman"), ("garasi",)}      # 2 kamera ringan -> TETAP 1 run_garasi
+    # 1 run_live taman + 1 run_garasi (semua ringan) + segrec per kamera (rekam default true)
+    assert set(d) == {("live", "taman"), ("garasi",),
+                      ("segrec", "taman"), ("segrec", "garasi"), ("segrec", "gudang")}
     assert d[("garasi",)][1] == build_garasi_cmd("cameras.json")
 
 
@@ -37,8 +39,24 @@ def test_desired_dua_taman():
         {"nama": "belakang", "stream": "belakang", "peran": "taman-penuh", "enabled": True},
     ]}
     d = desired_procs(cfg, "cameras.json")
-    assert set(d) == {("live", "taman"), ("live", "belakang")}   # run_live per kamera taman
+    assert set(d) == {("live", "taman"), ("live", "belakang"),
+                      ("segrec", "taman"), ("segrec", "belakang")}
     assert ("garasi",) not in d
+
+
+def test_desired_rekam_false():
+    cfg = {"kamera": [{"nama": "x", "stream": "x", "peran": "taman-penuh", "enabled": True, "rekam": False}]}
+    assert set(desired_procs(cfg, "cameras.json")) == {("live", "x")}   # rekam false -> tanpa segrec
+
+
+def test_segrec_env_per_kamera():
+    cfg = {"kamera": [{"nama": "garasi", "stream": "garasi", "peran": "garasi-ringan",
+                       "enabled": True, "rekam_gb": 20}]}
+    env = desired_procs(cfg, "cameras.json")[("segrec", "garasi")][2]
+    assert env["SEG_DIR"].endswith("out/segments/garasi")
+    assert env["SEGREC_URL"].endswith("/garasi")
+    assert env["SEG_MAX_GB"] == "20"
+    assert "garasi" in env["SEGREC_HEALTH"] and "garasi" in env["SEGREC_CLIPTMP"]
 
 
 def test_desired_skip_disabled_dan_tanpa_stream():

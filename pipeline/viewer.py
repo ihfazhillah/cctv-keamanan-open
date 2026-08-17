@@ -365,15 +365,35 @@ def load_segrec(root, seg_dir, clip_dir, max_s):
     SEGREC["ok"] = bool(segcut) and os.path.isdir(os.path.join(root, seg_dir))
 
 
-def seg_index():
-    """Hari->jam tersedia di arsip (dibaca dari struktur folder, murah tiap request)."""
-    out = {"ok": SEGREC["ok"], "tz": time.strftime("%Z"), "days": []}
-    if not SEGREC["ok"]:
-        return out
+def _cam_seg_dir(camera):
+    return os.path.join(ROOT, SEGREC["seg_dir"], os.path.basename(camera or ""))   # basename = anti-traversal
+
+
+def seg_cameras():
+    """Nama kamera yang punya arsip (subfolder out/segments/<cam>/YYYYMMDD)."""
     base = os.path.join(ROOT, SEGREC["seg_dir"])
+    out = []
+    try:
+        for c in sorted(os.listdir(base)):
+            d = os.path.join(base, c)
+            if (os.path.isdir(d) and re.fullmatch(r"[A-Za-z0-9_-]+", c)
+                    and any(re.fullmatch(r"\d{8}", x) for x in os.listdir(d))):
+                out.append(c)
+    except OSError:
+        pass
+    return out
+
+
+def seg_index(camera):
+    """Hari->jam tersedia utk 1 kamera. Sertakan daftar `cameras` (utk pemilih UI)."""
+    out = {"ok": SEGREC["ok"], "camera": camera, "tz": time.strftime("%Z"),
+           "cameras": seg_cameras(), "days": []}
+    if not (SEGREC["ok"] and camera):
+        return out
+    base = _cam_seg_dir(camera)
     try:
         days = sorted((d for d in os.listdir(base) if re.fullmatch(r"\d{8}", d)), reverse=True)
-    except FileNotFoundError:
+    except OSError:
         return out
     for day in days:
         dday = os.path.join(base, day)
@@ -405,7 +425,7 @@ def _seg_epoch_of(day, hms):
                         parts[0], parts[1], parts[2], 0, 0, -1))
 
 
-def seg_grab(start, end):
+def seg_grab(camera, start, end):
     if not SEGREC["ok"]:
         return {"ok": False, "error": "arsip segrec tak tersedia (out/segments / modul cut)"}
     dur = end - start
@@ -416,15 +436,14 @@ def seg_grab(start, end):
 
     clip_dir = os.path.join(ROOT, SEGREC["clip_dir"])
     os.makedirs(clip_dir, exist_ok=True)
-    fname = f"seg_{int(start)}_{int(end)}.mp4"
+    fname = f"seg_{os.path.basename(camera)}_{int(start)}_{int(end)}.mp4"
     outpath = os.path.join(clip_dir, fname)
     url_out = "/segclip/" + quote(fname)
     if os.path.isfile(outpath) and os.path.getsize(outpath) > 1000:
         return {"ok": True, "file": fname, "url": url_out, "seconds": round(dur, 1), "cached": True}
 
-    seg_dir = os.path.join(ROOT, SEGREC["seg_dir"])
     try:
-        res = segcut.cut(seg_dir, start, end, outpath)
+        res = segcut.cut(_cam_seg_dir(camera), start, end, outpath)
     except Exception as e:
         return {"ok": False, "error": f"cut gagal: {e}"}
     if res and os.path.isfile(outpath) and os.path.getsize(outpath) > 1000:
@@ -434,27 +453,27 @@ def seg_grab(start, end):
 
 
 def seg_grab_from_qs(qs):
+    camera = qs.get("camera", [""])[0]
     day = qs.get("day", [""])[0]
     start_s = qs.get("start", [""])[0]
     end_s = qs.get("end", [""])[0]
-    if not (re.fullmatch(r"\d{8}", day or "") and start_s and end_s):
-        return {"ok": False, "error": "parameter day/start/end tidak valid"}
+    if not (re.fullmatch(r"[A-Za-z0-9_-]+", camera or "") and re.fullmatch(r"\d{8}", day or "") and start_s and end_s):
+        return {"ok": False, "error": "parameter camera/day/start/end tidak valid"}
     try:
         start = _seg_epoch_of(day, start_s)
         end = _seg_epoch_of(day, end_s)
     except (ValueError, IndexError):
         return {"ok": False, "error": "format waktu tidak valid (HH:MM:SS)"}
-    return seg_grab(start, end)
+    return seg_grab(camera, start, end)
 
 
-def seg_hls(day, hour):
-    """Playlist HLS VOD utk satu jam: menunjuk seg_*.ts LANGSUNG (tanpa re-mux) ->
-    putar jam penuh + seek instan di browser (via hls.js). Segmen segrec sudah
-    MPEG-TS h264+AAC = segmen HLS apa adanya. EXTINF nominal seg_time; jeda (segrec
-    restart) -> #EXT-X-DISCONTINUITY. Kembalikan teks m3u8 atau None."""
+def seg_hls(camera, day, hour):
+    """Playlist HLS VOD utk satu jam 1 kamera: menunjuk seg_*.ts LANGSUNG (tanpa
+    re-mux) -> putar jam penuh + seek instan (hls.js). Segmen segrec sudah MPEG-TS
+    h264+AAC. Jeda (segrec restart) -> #EXT-X-DISCONTINUITY. Return m3u8 atau None."""
     if not SEGREC["ok"]:
         return None
-    hd = os.path.join(ROOT, SEGREC["seg_dir"], day, hour)
+    hd = os.path.join(_cam_seg_dir(camera), day, hour)
     if not os.path.isdir(hd):
         return None
     try:
@@ -472,22 +491,21 @@ def seg_hls(day, hour):
         if i and eps[i] is not None and eps[i - 1] is not None and (eps[i] - eps[i - 1]) > seg_time * 1.5:
             lines.append("#EXT-X-DISCONTINUITY")           # jeda rekaman -> reset timeline decoder
         lines.append(f"#EXTINF:{float(seg_time):.3f},")
-        lines.append(f"/seg/ts/{day}/{hour}/{quote(n)}")
+        lines.append(f"/seg/ts/{quote(camera)}/{day}/{hour}/{quote(n)}")
     lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines) + "\n"
 
 
-def seg_locate(ts):
-    """Petakan epoch -> (day, hour, offset) dalam playlist HLS jam itu, agar bisa
-    'buka event di arsip' & lompat ke detiknya. offset = ts - epoch segmen PERTAMA
-    jam itu (timeline HLS mulai dari segmen pertama, bukan HH:00:00). ok:False bila
-    jam tak terarsip (di luar retensi)."""
+def seg_locate(camera, ts):
+    """Petakan epoch -> (camera, day, hour, offset) di playlist HLS jam itu, agar
+    'buka event di arsip' bisa lompat ke detiknya. offset = ts - epoch segmen PERTAMA
+    jam itu. ok:False bila jam tak terarsip (di luar retensi)."""
     if not SEGREC["ok"]:
         return {"ok": False, "error": "arsip tak tersedia"}
     lt = time.localtime(ts)
     day = time.strftime("%Y%m%d", lt)
     hour = time.strftime("%H", lt)
-    hd = os.path.join(ROOT, SEGREC["seg_dir"], day, hour)
+    hd = os.path.join(_cam_seg_dir(camera), day, hour)
     if not os.path.isdir(hd):
         return {"ok": False, "error": "tak ada arsip untuk waktu itu (di luar retensi?)"}
     try:
@@ -499,15 +517,18 @@ def seg_locate(ts):
     if not eps:
         return {"ok": False, "error": "jam arsip kosong"}
     offset = max(0.0, ts - min(eps))
-    return {"ok": True, "day": day, "hour": hour, "offset": round(offset, 1)}
+    return {"ok": True, "camera": camera, "day": day, "hour": hour, "offset": round(offset, 1)}
 
 
 def seg_locate_from_qs(qs):
+    camera = qs.get("camera", ["taman"])[0] or "taman"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", camera):
+        return {"ok": False, "error": "camera tidak valid"}
     try:
         ts = float(qs.get("ts", [""])[0])
     except (ValueError, IndexError):
         return {"ok": False, "error": "parameter ts tidak valid"}
-    return seg_locate(ts)
+    return seg_locate(camera, ts)
 
 
 # ══ Episode: kelompokkan passage SE-ARAH jadi satu transit ══════════════════════
@@ -665,7 +686,7 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/nvr/grab":
             self._json(nvr_grab_from_qs(qs))
         elif u.path == "/api/seg/index":
-            self._json(seg_index())
+            self._json(seg_index(qs.get("camera", [""])[0]))
         elif u.path == "/api/seg/clip":
             self._json(seg_grab_from_qs(qs))
         elif u.path == "/api/seg/hls":
@@ -761,11 +782,12 @@ class Handler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def _seg_hls(self, qs):
-        day = qs.get("day", [""])[0]; hour = qs.get("hour", [""])[0]
-        if not (re.fullmatch(r"\d{8}", day or "") and re.fullmatch(r"\d{2}", hour or "")):
+        camera = qs.get("camera", [""])[0]; day = qs.get("day", [""])[0]; hour = qs.get("hour", [""])[0]
+        if not (re.fullmatch(r"[A-Za-z0-9_-]+", camera or "")
+                and re.fullmatch(r"\d{8}", day or "") and re.fullmatch(r"\d{2}", hour or "")):
             self.send_error(400)
             return
-        pl = seg_hls(day, hour)
+        pl = seg_hls(camera, day, hour)
         if not pl:
             self.send_error(404)
             return
@@ -779,16 +801,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _seg_ts(self, sub):
         parts = unquote(sub).split("/")
-        if len(parts) != 3:
+        if len(parts) != 4:
             self.send_error(404)
             return
-        day, hour, name = parts
+        camera, day, hour, name = parts
         name = os.path.basename(name)
-        if not (re.fullmatch(r"\d{8}", day) and re.fullmatch(r"\d{2}", hour)
-                and re.fullmatch(r"seg_\d{8}_\d{6}\.ts", name)):
+        if not (re.fullmatch(r"[A-Za-z0-9_-]+", camera) and re.fullmatch(r"\d{8}", day)
+                and re.fullmatch(r"\d{2}", hour) and re.fullmatch(r"seg_\d{8}_\d{6}\.ts", name)):
             self.send_error(404)
             return
-        self._serve_path(os.path.join(ROOT, SEGREC["seg_dir"], day, hour, name), name)
+        self._serve_path(os.path.join(_cam_seg_dir(camera), day, hour, name), name)
 
     do_HEAD = do_GET
 
@@ -1052,6 +1074,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="frow">
         <select id="cam" class="eventOnly" aria-label="Kamera" hidden><option value="">semua kamera</option></select>
         <select id="zone" class="eventOnly" aria-label="Zona"><option value="">semua zona</option></select>
+        <select id="segCam" aria-label="Kamera arsip" hidden></select>
         <select id="day" aria-label="Hari"><option value="">semua hari</option></select>
       </div>
       <label class="note eventOnly"><input type="checkbox" id="mediaOnly"> hanya yang punya video/snapshot</label>
@@ -1268,7 +1291,7 @@ function renderEpDetail(e){
       <dt>Passage</dt><dd>${e.kinds.join(" → ")}</dd>
     </dl>
     ${arsipBtn(e.start)}</div>`;
-  wireArsipBtn(e.start);
+  wireArsipBtn(e.start, "taman");   // episode = kamera taman
 }
 
 // ── tarik footage penuh dari NVR ──
@@ -1355,10 +1378,15 @@ function renderLiveGrid(list){
 
 // ── arsip segrec: potong rentang waktu dari segmen ──
 async function fetchSegIndex(){
-  const r = await (await fetch("/api/seg/index")).json();
+  const sel = $("#segCam"), cam = sel.value;
+  const r = await (await fetch("/api/seg/index?camera=" + encodeURIComponent(cam))).json();
+  if(r.cameras && r.cameras.length && sel.options.length !== r.cameras.length)
+    sel.innerHTML = r.cameras.map(c => `<option value="${c}">📷 ${c}</option>`).join("");
+  sel.hidden = !(r.cameras && r.cameras.length);
+  if(!cam && r.cameras && r.cameras.length){ sel.value = r.cameras[0]; return fetchSegIndex(); }
   ALL = [];
   (r.days||[]).forEach(d => (d.hours||[]).forEach(h => {
-    ALL.push({ id: ALL.length, day: d.day, hour: h.h, n: h.n,
+    ALL.push({ id: ALL.length, camera: r.camera, day: d.day, hour: h.h, n: h.n,
       when: `${d.day.slice(0,4)}-${d.day.slice(4,6)}-${d.day.slice(6,8)} ${h.h}:00` });
   }));
   render();
@@ -1379,7 +1407,7 @@ function renderSegStage(e){
     <div id="segResult"></div></div>`;
   $("#segStart").oninput = updateSegRange;
   $("#segEnd").oninput = updateSegRange;
-  $("#segHls").onclick = () => playHls(SELE.day, SELE.hour);
+  $("#segHls").onclick = () => playHls(SELE.camera, SELE.day, SELE.hour);
   $("#segPlay").onclick = grabSeg;
   updateSegRange();
 }
@@ -1396,15 +1424,15 @@ function ensureHls(){
   return _hlsLib;
 }
 function killHls(){ if(curHls){ try{ curHls.destroy(); }catch(e){} curHls = null; } }
-async function playHls(day, hour, seekTo){
+async function playHls(camera, day, hour, seekTo){
   killHls();
   seekTo = seekTo > 0 ? seekTo : 0;
-  const url = `/api/seg/hls?day=${day}&hour=${hour}`;
+  const url = `/api/seg/hls?camera=${encodeURIComponent(camera)}&day=${day}&hour=${hour}`;
   const seekNote = seekTo ? ` · @${Math.floor(seekTo/60)}m${String(Math.floor(seekTo%60)).padStart(2,"0")}s` : "";
   $("#stage").innerHTML = `
     <div class="screen"><video id="hlsvid" controls autoplay playsinline></video>
-      <div class="scan"></div><div class="rec"><span class="b"></span>ARSIP ${hour}:00</div></div>
-    <div class="cap"><span class="fn mono">jam ${hour}:00 · HLS (jam penuh, seek instan)${seekNote}</span>
+      <div class="scan"></div><div class="rec"><span class="b"></span>ARSIP ${camera} ${hour}:00</div></div>
+    <div class="cap"><span class="fn mono">${camera} · jam ${hour}:00 · HLS (jam penuh, seek instan)${seekNote}</span>
       <a href="${url}">playlist .m3u8</a></div>`;
   const v = $("#hlsvid");
   // hls.js DULU: Chrome balas canPlayType('...mpegurl')='maybe' padahal tak bisa
@@ -1423,12 +1451,13 @@ async function playHls(day, hour, seekTo){
     if(seekTo) v.addEventListener("loadedmetadata", () => { v.currentTime = seekTo; }, {once:true});
   } else { $("#stage").innerHTML = `<div class="placeholder">HLS tak didukung browser ini.</div>`; }
 }
-async function openInArsip(ts){
+async function openInArsip(ts, camera){
+  camera = camera || "taman";
   let r;
-  try { r = await (await fetch("/api/seg/locate?ts=" + ts)).json(); }
+  try { r = await (await fetch(`/api/seg/locate?camera=${encodeURIComponent(camera)}&ts=${ts}`)).json(); }
   catch(e){ r = {ok:false, error:String(e)}; }
-  if(r.ok){ playHls(r.day, r.hour, r.offset); }
-  else { $("#stage").innerHTML = `<div class="placeholder">Arsip: ${r.error||"tak tersedia"}</div>`; }
+  if(r.ok){ playHls(r.camera, r.day, r.hour, r.offset); }
+  else { $("#stage").innerHTML = `<div class="placeholder">Arsip (${camera}): ${r.error||"tak tersedia"}</div>`; }
 }
 function _hms(t){ const p=(t||"").split(":").map(Number); return (p[0]||0)*3600+(p[1]||0)*60+(p[2]||0); }
 function updateSegRange(){
@@ -1442,7 +1471,7 @@ async function grabSeg(){
   btn.disabled = true;
   st.innerHTML = '<span class="spinner"></span> memotong dari arsip…';
   try {
-    const r = await (await fetch(`/api/seg/clip?day=${day}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`)).json();
+    const r = await (await fetch(`/api/seg/clip?camera=${encodeURIComponent(SELE.camera)}&day=${day}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`)).json();
     if(r.ok){
       st.textContent = r.cached ? "sudah ada (cache)" : `selesai · ${((r.size||0)/1e6).toFixed(1)} MB`;
       $("#segResult").innerHTML = `<div class="done">
@@ -1490,7 +1519,7 @@ function renderStage(e, playlistMode){
 function arsipBtn(ts){   // tombol 'buka di arsip' bila arsip aktif & event punya jam nyata
   return (META.segrec && ts > 1e9) ? `<button class="ghost" id="toArsip" style="margin-top:10px">▶ buka di arsip (jam penuh)</button>` : "";
 }
-function wireArsipBtn(ts){ const b = $("#toArsip"); if(b) b.onclick = () => openInArsip(ts); }
+function wireArsipBtn(ts, camera){ const b = $("#toArsip"); if(b) b.onclick = () => openInArsip(ts, camera); }
 function renderDetail(e){
   $("#detailWrap").innerHTML = `
     <div class="detail">
@@ -1504,7 +1533,7 @@ function renderDetail(e){
       </dl>
       ${arsipBtn(e.ts)}
     </div>`;
-  wireArsipBtn(e.ts);
+  wireArsipBtn(e.ts, e.camera);
 }
 
 // ── putar semua (stream berurutan) ──
@@ -1554,6 +1583,7 @@ function setMode(m){
   document.querySelector(".log").hidden = (m==="live");                  // live pakai grid, bukan tabel
   document.querySelector(".console").classList.toggle("livefull", m==="live");  // grid LEBAR PENUH
   $("#liveBar").classList.toggle("show", m==="live");                    // bar navigasi mengambang
+  if(m!=="arsip") $("#segCam").hidden = true;                            // pemilih kamera arsip hanya di Arsip
   selId = null; SELE = null; killHls();
   $("#detailWrap").innerHTML = ""; $("#nvrWrap").innerHTML = "";
   const label = m==="episode" ? "episode" : m==="arsip" ? "jam arsip" : m==="live" ? "kamera live" : "event";
@@ -1566,6 +1596,7 @@ function setMode(m){
 let t;
 $("#q").oninput = () => { clearTimeout(t); t = setTimeout(refresh, 200); };
 $("#day").onchange = refresh;
+$("#segCam").onchange = fetchSegIndex;   // ganti kamera arsip -> ambil ulang index
 ["zone","mediaOnly","cam"].forEach(id => $("#"+id).onchange = fetchEvents);
 $("#gap").oninput = () => { clearTimeout(t); t = setTimeout(fetchEpisodes, 250); };
 $("#modeSeg").addEventListener("click", ev => { const b = ev.target.closest("button"); if(b) setMode(b.dataset.m); });

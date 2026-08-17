@@ -256,6 +256,7 @@ def main():
         raise SystemExit(2)
     os.makedirs(SEG_DIR, exist_ok=True)
     proc = start_ffmpeg()
+    ff_start = time.time()                # kapan ffmpeg (re)start -> grace period stall-check
     next_house = 0.0
     next_test = time.time() + 60          # self-test pertama setelah 1 mnt (biar segmen terkumpul)
     backoff = 2
@@ -272,6 +273,7 @@ def main():
                 break
             backoff = min(backoff * 2, 60)
             proc = start_ffmpeg()
+            ff_start = time.time()
             continue
         backoff = 2
 
@@ -282,9 +284,11 @@ def main():
             housekeeping()
             next_house = now + 120
 
-        # 3) freshness: ffmpeg hidup tapi segmen macet?
+        # 3) freshness: ffmpeg hidup tapi segmen macet? (beri GRACE sejak ffmpeg start,
+        # supaya tak membunuh ffmpeg sebelum ia sempat menulis segmen segar pertama —
+        # mis. setelah jeda/migrasi arsip: segmen terbaru "lama" tapi ffmpeg baru mulai)
         age = newest_seg_age()
-        stale = age is not None and age > SEG_TIME * 4
+        stale = (age is not None and age > SEG_TIME * 4 and (now - ff_start) > SEG_TIME * 4)
         if stale:
             _state["last_error"] = f"segmen macet (age={age:.0f}s) -> restart ffmpeg"
             log(_state["last_error"])

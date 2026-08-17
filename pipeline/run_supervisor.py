@@ -55,21 +55,40 @@ def build_garasi_cmd(cameras_file):
     return [PY, os.path.join(PIPE, "run_garasi.py"), "--cameras-file", cameras_file]
 
 
+def build_segrec_cmd():
+    return [PY, os.path.join(ROOT, "segrec", "run_segrec.py")]
+
+
+def segrec_env(cam):
+    """Env per-instance segrec: 1 kamera -> subfolder + health/tmp/cap sendiri
+    (tak collide antar-instance). run_segrec sudah 100% env-driven -> nol ubah kode."""
+    nama = cam["nama"]
+    return {
+        "SEGREC_URL": stream_url(cam["stream"]),
+        "SEG_DIR": os.path.join("out/segments", nama),
+        "SEG_MAX_GB": str(cam.get("rekam_gb", 30)),
+        "SEGREC_HEALTH": f"out/segrec-health-{nama}.json",
+        "SEGREC_CLIPTMP": f"out/segrec-selftest-{nama}.mp4",
+    }
+
+
 def desired_procs(cfg, cameras_file):
-    """key -> (label, cmd). Satu run_live per taman-penuh; satu run_garasi utk SEMUA
-    kamera ringan. key stabil supaya rekonsiliasi tak salah restart."""
+    """key -> (label, cmd, env). Per kamera enabled: taman-penuh -> run_live;
+    garasi-ringan -> (satu) run_garasi utk semua ringan; rekam!=false -> run_segrec
+    (subfolder out/segments/<nama>). env=None -> warisi (live/garasi)."""
     procs = {}
     ada_garasi = False
     for k in cfg.get("kamera", []):
         if not (k.get("enabled", True) and k.get("nama") and k.get("stream")):
             continue
-        peran = k.get("peran")
-        if peran == "taman-penuh":
-            procs[("live", k["nama"])] = (f"live:{k['nama']}", build_taman_cmd(k))
-        elif peran == "garasi-ringan":
+        if k.get("peran") == "taman-penuh":
+            procs[("live", k["nama"])] = (f"live:{k['nama']}", build_taman_cmd(k), None)
+        elif k.get("peran") == "garasi-ringan":
             ada_garasi = True
+        if k.get("rekam", True):
+            procs[("segrec", k["nama"])] = (f"segrec:{k['nama']}", build_segrec_cmd(), segrec_env(k))
     if ada_garasi:
-        procs[("garasi",)] = ("garasi", build_garasi_cmd(cameras_file))
+        procs[("garasi",)] = ("garasi", build_garasi_cmd(cameras_file), None)
     return procs
 
 
@@ -89,10 +108,11 @@ def main():
     cfg = read_cameras(cameras_file)
     print(f"[SUPER] mulai cameras-file={cameras_file} root={ROOT}", flush=True)
 
-    def spawn(key, label, cmd):
+    def spawn(key, label, cmd, env):
         print(f"[SUPER] start {label}", flush=True)
-        p = subprocess.Popen(cmd, cwd=ROOT)          # warisi env (.env dari supervisor)
-        running[key] = {"proc": p, "cmd": cmd, "label": label}
+        e = {**os.environ, **env} if env else None   # None -> warisi penuh (.env supervisor)
+        p = subprocess.Popen(cmd, cwd=ROOT, env=e)
+        running[key] = {"proc": p, "cmd": cmd, "env": env, "label": label}
 
     def kill(key):
         info = running.pop(key, None)
@@ -120,16 +140,16 @@ def main():
                 cfg = read_cameras(cameras_file)
                 print("[SUPER] cameras.json dimuat", flush=True)
             want = desired_procs(cfg, cameras_file)
-            for key in list(running):                                  # stop yg tak diinginkan / cmd berubah
-                if key not in want or want[key][1] != running[key]["cmd"]:
+            for key in list(running):                                  # stop yg tak diinginkan / cmd|env berubah
+                if key not in want or (want[key][1], want[key][2]) != (running[key]["cmd"], running[key]["env"]):
                     kill(key)
-            for key, (label, cmd) in want.items():                     # start baru / restart mati
+            for key, (label, cmd, env) in want.items():                # start baru / restart mati
                 info = running.get(key)
                 if info is None:
-                    spawn(key, label, cmd)
+                    spawn(key, label, cmd, env)
                 elif info["proc"].poll() is not None:
                     print(f"[SUPER] {label} mati (rc={info['proc'].returncode}) -> restart", flush=True)
-                    spawn(key, label, cmd)
+                    spawn(key, label, cmd, env)
             time.sleep(args.interval)
     finally:
         for key in list(running):
