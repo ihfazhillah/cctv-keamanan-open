@@ -554,7 +554,8 @@ class EpisodeRecorder:
         self.scene = scene            # SceneEpisode (otak keputusan)
         self.out_dir = out_dir
         self.log_path = log_path
-        self.writer = writer          # db.EventWriter -> mirror episode ke DB (notif-dari-episode)
+        self.db = writer              # db.EventWriter -> mirror episode ke DB (JANGAN pakai self.writer:
+                                      # itu VideoWriter cv2 di kelas ini)
         self.pre_s = pre_s            # detik pra-rekam sebelum orang muncul
         self.fps = fps
         self.rolling = FrameBuffer(keep_s=max(6, int(pre_s) + 2))
@@ -612,12 +613,12 @@ class EpisodeRecorder:
             f.write(json.dumps({**ev, "clip": os.path.basename(final)}) + "\n")
         # mirror ke DB: notif masuk/keluar dari episode (saring 'lewat' & yg cuma jalan-utama).
         # clip = episode klip pipeline (fallback bila potong-segmen gagal).
-        if self.writer:
+        if self.db:
             gates = ev.get("gates", [])
             layak = ev.get("arah") in ("masuk", "keluar") and any(g != "jalan-utama" for g in gates)
             notify = 1 if (NOTIFY_FROM_EPISODE and layak) else 0
-            self.writer.tulis(ts=ev.get("start", 0), kind="episode", clip=os.path.basename(final),
-                              notify=notify, payload=dict(ev))
+            self.db.tulis(ts=ev.get("start", 0), kind="episode", clip=os.path.basename(final),
+                          notify=notify, payload=dict(ev))
         print(f"[EPISODE] {ev['arah']} {ev['gates']} -> {os.path.basename(final)}", flush=True)
 
     def close(self):
