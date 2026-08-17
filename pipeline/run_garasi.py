@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Detektor orang GARASI — ringan & bergerbang-jadwal (alur TERPISAH dari taman).
+"""Detektor orang MULTI-KAMERA ringan (alur TERPISAH dari pipeline taman penuh).
 
-Baca stream go2rtc (nama, bukan URL berkredensial), deteksi kelas `person`
-(yolo11s, TANPA tracker/ReID), dan HANYA di dalam jendela jadwal -> lahirkan event
-`garasi` ke cctv.db (notify=1) sehingga service bot mengirim notif teks. Di luar
-jendela: proses TETAP hidup, lewati inferensi (hemat GPU). Jadwal dibaca LIVE dari
-cameras.json (edit dari viewer -> berlaku tanpa restart, via mtime).
+SATU service, banyak stream: supervisor membaca cameras.json dan menjalankan satu
+worker-thread per kamera peran `garasi-ringan`. Menambah kamera = tambah entri di
+cameras.json (dari viewer/Telegram) -> supervisor start worker-nya LIVE, tanpa
+systemctl. Model YOLO DIBAGI semua worker (satu load VRAM; predict di-serialize).
+
+Tiap worker: baca stream go2rtc (nama, bukan URL berkredensial), deteksi kelas
+`person` (yolo11s, tanpa tracker), dan HANYA di dalam jendela jadwal -> event
+`garasi` (tag camera) ke cctv.db (notify=1) -> bot kirim notif. Di luar jendela:
+worker hidup, lewati inferensi (hemat GPU). Jadwal/enabled dibaca LIVE (mtime).
 
     uv run --env-file .env pipeline/run_garasi.py --cameras-file cameras.json
 
-Slice pertama: deteksi + notif. Config UI viewer & tampil-di-viewer menyusul.
 Logika murni (dalam_jendela, Debounce) teruji -> test_run_garasi.py.
 """
 import os
@@ -17,6 +20,7 @@ import json
 import time
 import signal
 import argparse
+import threading
 from pathlib import Path
 
 from db import EventWriter                      # kontrak notif SAMA dgn pipeline inti
@@ -139,6 +143,72 @@ def ada_person(model, frame, conf):
     return False
 
 
+class Worker(threading.Thread):
+    """Satu thread deteksi per kamera garasi-ringan. Model DIBAGI antar-worker
+    (satu load VRAM) -> predict di-serialize `mlock` (garasi fps rendah, kontensi
+    minim). Jadwal/enabled dibaca live dari watcher (per-kamera by nama)."""
+
+    def __init__(self, nama, watcher, model, mlock, writer, args):
+        super().__init__(name=f"garasi:{nama}", daemon=True)
+        self.nama, self.watcher, self.model = nama, watcher, model
+        self.mlock, self.writer, self.args = mlock, writer, args
+        self.stop = False
+
+    def _cam(self):
+        for k in self.watcher.cfg.get("kamera", []):
+            if k.get("nama") == self.nama and k.get("peran") == "garasi-ringan":
+                return k
+        return None
+
+    def run(self):
+        cam = self._cam()
+        if not cam:
+            return
+        try:
+            source = FrameSource(stream_url(cam["stream"]))
+        except Exception as e:
+            print(f"[GARASI:{self.nama}] gagal buka stream ({e!r})", flush=True)
+            return
+        deb = Debounce(self.args.need_frames, self.args.cooldown)
+        i, last_hb = 0, 0.0
+        print(f"[GARASI:{self.nama}] worker mulai stream={cam['stream']}", flush=True)
+        try:
+            for t, frame in source.frames():
+                if self.stop:
+                    break
+                cam = self._cam()
+                if cam is None or not cam.get("enabled", True):
+                    break                                   # dihapus/dimatikan -> keluar (tak di-restart)
+                i += 1
+                aktif = dalam_jendela(t, cam.get("jadwal", []))
+                if t - last_hb >= 30:
+                    print(f"[HIDUP] {self.nama} frame#{i} jendela={'aktif' if aktif else 'tidur'}", flush=True)
+                    last_hb = t
+                if not aktif or (i % self.args.every):
+                    continue                                # luar jendela / bukan frame ke-N
+                with self.mlock:                            # serialize akses model bersama
+                    ada = ada_person(self.model, frame, self.args.conf)
+                if deb.on_frame(ada, t):
+                    print(f"[GARASI:{self.nama}] orang terdeteksi @ {time.strftime('%H:%M:%S')}"
+                          f"{' (dry-run)' if self.args.dry_run else ''}", flush=True)
+                    if self.writer:
+                        self.writer.tulis(ts=t, kind="garasi", notify=1,
+                                          payload={"kind": "garasi", "camera": self.nama, "at": t})
+        finally:
+            source.release()
+            print(f"[GARASI:{self.nama}] worker berhenti", flush=True)
+
+
+def kamera_garasi(cfg):
+    """nama-nama kamera peran garasi-ringan yang enabled (punya nama unik)."""
+    out = []
+    for k in cfg.get("kamera", []):
+        if (k.get("peran") == "garasi-ringan" and k.get("enabled", True)
+                and k.get("nama") and k["nama"] not in out):
+            out.append(k["nama"])
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description="Detektor orang garasi (gated by jadwal)")
     ap.add_argument("--cameras-file", default="cameras.json")
@@ -151,52 +221,41 @@ def main():
     args = ap.parse_args()
 
     watcher = ConfigWatcher(args.cameras_file)
-    cam = pilih_kamera(watcher.cfg)
-    if not cam:
-        print("[GARASI] tak ada kamera peran 'garasi-ringan' enabled -> keluar", flush=True)
-        return
-    print(f"[GARASI] mulai kamera={cam['nama']} stream={cam['stream']} "
-          f"model={args.model} dry_run={args.dry_run}", flush=True)
 
     from ultralytics import YOLO
-    model = YOLO(args.model)
+    model = YOLO(args.model)                     # DIBAGI semua worker (satu load VRAM)
+    mlock = threading.Lock()
     writer = None if args.dry_run else EventWriter()
-    deb = Debounce(args.need_frames, args.cooldown)
 
     stop = {"v": False}
     signal.signal(signal.SIGTERM, lambda *a: stop.update(v=True))
     signal.signal(signal.SIGINT, lambda *a: stop.update(v=True))
 
-    source = FrameSource(stream_url(cam["stream"]))
-    i = 0
-    last_hb = 0.0
+    print(f"[GARASI] supervisor mulai model={args.model} dry_run={args.dry_run}", flush=True)
+    workers = {}                                 # nama -> Worker
     try:
-        for t, frame in source.frames():
-            if stop["v"]:
-                break
+        while not stop["v"]:
             watcher.reload_if_changed()
-            cam = pilih_kamera(watcher.cfg) or cam          # enabled/jadwal live
-            i += 1
-            aktif = dalam_jendela(t, cam.get("jadwal", []))
-            if t - last_hb >= 30:
-                print(f"[HIDUP] {time.strftime('%H:%M:%S')} frame#{i} "
-                      f"jendela={'aktif' if aktif else 'tidur'}", flush=True)
-                last_hb = t
-            if not aktif:
-                continue                                    # luar jendela -> skip inferensi (hemat GPU)
-            if i % args.every:
-                continue                                    # fps rendah
-            if deb.on_frame(ada_person(model, frame, args.conf), t):
-                print(f"[GARASI] orang terdeteksi @ {time.strftime('%H:%M:%S')}"
-                      f"{' (dry-run)' if args.dry_run else ' -> event'}", flush=True)
-                if writer:
-                    writer.tulis(ts=t, kind="garasi", notify=1,
-                                 payload={"kind": "garasi", "camera": cam["nama"], "at": t})
+            want = kamera_garasi(watcher.cfg)
+            for nama in want:                    # start baru / restart yang mati (stream putus)
+                w = workers.get(nama)
+                if w is None or not w.is_alive():
+                    nw = Worker(nama, watcher, model, mlock, writer, args)
+                    workers[nama] = nw
+                    nw.start()
+            for nama, w in list(workers.items()):  # stop yang tak lagi diinginkan
+                if nama not in want:
+                    w.stop = True
+                    del workers[nama]
+                    print(f"[GARASI] lepas worker {nama} (dihapus/dimatikan config)", flush=True)
+            time.sleep(3)                        # rekonsiliasi berkala + saat cameras.json berubah
     finally:
-        source.release()
+        for w in workers.values():
+            w.stop = True
+        time.sleep(0.5)
         if writer:
             writer.close()
-        print("[GARASI] berhenti.", flush=True)
+        print("[GARASI] supervisor berhenti.", flush=True)
 
 
 if __name__ == "__main__":

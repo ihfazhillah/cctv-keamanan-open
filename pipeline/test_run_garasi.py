@@ -1,6 +1,6 @@
 """Test nol-deps utk logika murni detektor garasi (dalam_jendela + Debounce)."""
 import time
-from run_garasi import dalam_jendela, Debounce, pilih_kamera, _in_window
+from run_garasi import dalam_jendela, Debounce, pilih_kamera, kamera_garasi, _in_window
 
 
 def _epoch(hh, mm):
@@ -67,6 +67,17 @@ def test_pilih_kamera():
     assert pilih_kamera(cfg)["nama"] == "garasi"
     cfg["kamera"][1]["enabled"] = False
     assert pilih_kamera(cfg) is None
+
+
+def test_kamera_garasi_multi():
+    cfg = {"kamera": [
+        {"nama": "taman", "peran": "taman-penuh", "enabled": True},
+        {"nama": "garasi", "peran": "garasi-ringan", "enabled": True},
+        {"nama": "gudang", "peran": "garasi-ringan", "enabled": True},
+        {"nama": "off1", "peran": "garasi-ringan", "enabled": False},
+    ]}
+    assert kamera_garasi(cfg) == ["garasi", "gudang"]        # hanya garasi-ringan enabled
+    assert kamera_garasi({"kamera": []}) == []
 
 
 if __name__ == "__main__":

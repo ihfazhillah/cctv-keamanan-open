@@ -1,5 +1,5 @@
 [Unit]
-Description=CCTV garasi — detektor orang ringan (gated by jadwal, notif via bot)
+Description=CCTV garasi — detektor orang MULTI-KAMERA (dari cameras.json, gated by jadwal)
 After=network-online.target
 
 [Service]
