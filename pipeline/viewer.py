@@ -948,9 +948,10 @@ INDEX_HTML = r"""<!doctype html>
   .stage .cap a:hover { text-decoration:underline; }
 
   /* Live: grid semua kamera (gaya video-call). Klik ⛶ -> layar penuh 1 kamera. */
-  .stage.livewrap { background:transparent; border:0; box-shadow:none; overflow:visible; }
-  .livegrid { display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(300px,1fr)); }
-  .livetile { position:relative; aspect-ratio:16/9; background:var(--screen); border:1px solid var(--line); border-radius:10px; overflow:hidden; box-shadow:var(--shadow); }
+  .stage.livewrap { background:transparent; border:0; box-shadow:none; overflow:visible; flex:1; min-height:0; }
+  /* fit-semua-di-layar (video-call): kolom dari --cols, baris bagi rata tinggi -> tak perlu scroll */
+  .livegrid { display:grid; gap:8px; height:100%; grid-template-columns:repeat(var(--cols,2), 1fr); grid-auto-rows:1fr; }
+  .livetile { position:relative; min-height:0; background:var(--screen); border:1px solid var(--line); border-radius:10px; overflow:hidden; box-shadow:var(--shadow); }
   .livetile iframe { width:100%; height:100%; border:0; display:block; background:var(--screen); }
   .livetile .livetag { position:absolute; top:8px; left:10px; display:flex; align-items:center; gap:6px; font-size:12px; font-weight:650; color:#fff; text-shadow:0 1px 2px #000; z-index:2; pointer-events:none; }
   .livetile .livetag .b { width:8px; height:8px; border-radius:50%; background:var(--ev-exit); box-shadow:0 0 0 3px rgba(232,116,107,.3); }
@@ -1340,7 +1341,8 @@ async function fetchLive(){
 function renderLiveGrid(list){
   const g2 = g2base();
   if(!list.length){ $("#stage").innerHTML = `<div class="placeholder">tak ada stream go2rtc (pastikan go2rtc jalan)</div>`; return; }
-  $("#stage").innerHTML = `<div class="livegrid">${list.map(e => `
+  const cols = Math.max(1, Math.ceil(Math.sqrt(list.length)));   // 2->2, 4->2, 6->3, 9->3, 12->4 …
+  $("#stage").innerHTML = `<div class="livegrid" style="--cols:${cols}">${list.map(e => `
     <div class="livetile" data-name="${e.name}">
       <iframe src="${g2}/stream.html?src=${encodeURIComponent(e.name)}" allow="autoplay; fullscreen"></iframe>
       <div class="livetag"><span class="b"></span>${e.name}</div>
