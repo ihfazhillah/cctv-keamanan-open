@@ -136,11 +136,86 @@ class FrameSource:
         self.cap.release()
 
 
-def ada_person(model, frame, conf):
-    for r in model.predict(frame, classes=[0], conf=conf, verbose=False):
-        if r.boxes is not None and len(r.boxes) > 0:
+def _dalam_rect(cx, cy, rects):
+    """(cx,cy) fraksi [0..1] jatuh di salah satu rect [x1,y1,x2,y2] fraksi?"""
+    for x1, y1, x2, y2 in rects:
+        if x1 <= cx <= x2 and y1 <= cy <= y2:
             return True
     return False
+
+
+def ada_person(model, frame, conf, abaikan=()):
+    """True bila ada box `person` yang PUSATNYA di luar semua zona `abaikan`
+    (fraksi). abaikan = kotak tetap tempat YOLO sering phantom (mis. tumpukan
+    barang pojok yg keliru dibaca orang di IR malam)."""
+    for r in model.predict(frame, classes=[0], conf=conf, verbose=False):
+        if r.boxes is None:
+            continue
+        h, w = r.orig_shape
+        for b in r.boxes:
+            x1, y1, x2, y2 = [float(v) for v in b.xyxy[0]]
+            cx, cy = (x1 + x2) / 2 / w, (y1 + y2) / 2 / h
+            if not _dalam_rect(cx, cy, abaikan):
+                return True
+    return False
+
+
+class MotionGate:
+    """Gerbang GERAK murah SEBELUM YOLO. Frame-diff grayscale (kecil+blur) vs frame
+    sampel sebelumnya; 'ada gerak' bila BLOB-berubah TERBESAR (komponen tersambung)
+    >= min_area. Pakai blob terbesar, BUKAN jumlah piksel: riak air/grain IR =
+    banyak titik kecil tersebar -> ditolak; orang berjalan = satu blob besar -> lolos.
+
+    Alasan: malam-IR, scene DIAM sering bikin YOLO memunculkan phantom-person (false
+    positive, mis. pojok bertumpuk) & buang GPU. Scene diam -> tak ada gerak -> YOLO
+    dilewati. `abaikan` (kotak fraksi) di-nol-kan dari diff -> area kolam/air yg
+    sering beriak tak membuka gerbang. Kecilkan+blur meredam grain. Warmup: frame
+    pertama -> 'diam'. Butuh cv2."""
+
+    def __init__(self, min_area_frac=0.0025, delta_thresh=25, size=(320, 180),
+                 blur=21, abaikan=()):
+        self.min_area_frac = min_area_frac
+        self.delta_thresh = delta_thresh
+        self.size = size
+        self.blur = blur | 1                       # ksize ganjil
+        self.abaikan = abaikan
+        self.prev = None
+        self._mask = None                          # cache mask piksel (0 di zona abaikan)
+
+    def _prep(self, frame):
+        import cv2
+        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        g = cv2.resize(g, self.size)
+        return cv2.GaussianBlur(g, (self.blur, self.blur), 0)
+
+    def _mask_for(self):
+        import numpy as np
+        if self._mask is None:
+            W, H = self.size
+            m = np.ones((H, W), np.uint8)
+            for x1, y1, x2, y2 in self.abaikan:
+                m[int(y1 * H):int(y2 * H), int(x1 * W):int(x2 * W)] = 0
+            self._mask = m
+        return self._mask
+
+    def ada_gerak(self, frame):
+        """(ada_gerak: bool, fraksi_blob_terbesar: float). Update baseline internal."""
+        import cv2
+        import numpy as np
+        g = self._prep(frame)
+        if self.prev is None:
+            self.prev = g
+            return False, 0.0
+        delta = cv2.absdiff(self.prev, g)
+        self.prev = g
+        _, th = cv2.threshold(delta, self.delta_thresh, 255, cv2.THRESH_BINARY)
+        if self.abaikan:
+            th = th * self._mask_for()             # buang gerak di zona abaikan (air/phantom)
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))  # buang speckle
+        nb, _, stats, _ = cv2.connectedComponentsWithStats(th, connectivity=8)
+        blob = max((stats[i, cv2.CC_STAT_AREA] for i in range(1, nb)), default=0)
+        frac = blob / float(self.size[0] * self.size[1])
+        return frac >= self.min_area_frac, frac
 
 
 class Worker(threading.Thread):
@@ -170,8 +245,14 @@ class Worker(threading.Thread):
             print(f"[GARASI:{self.nama}] gagal buka stream ({e!r})", flush=True)
             return
         deb = Debounce(self.args.need_frames, self.args.cooldown)
+        abaikan = [tuple(r) for r in cam.get("abaikan", [])]   # kotak fraksi: phantom/air
+        gate = None if not self.args.motion else MotionGate(
+            self.args.motion_area, self.args.motion_delta, abaikan=abaikan)
         i, last_hb = 0, 0.0
-        print(f"[GARASI:{self.nama}] worker mulai stream={cam['stream']}", flush=True)
+        n_gerak = n_yolo = 0                                # statistik utk tuning (heartbeat)
+        last_frac = 0.0
+        print(f"[GARASI:{self.nama}] worker mulai stream={cam['stream']} "
+              f"motion={'on' if gate else 'off'} abaikan={len(abaikan)} zona", flush=True)
         try:
             for t, frame in source.frames():
                 if self.stop:
@@ -182,12 +263,20 @@ class Worker(threading.Thread):
                 i += 1
                 aktif = dalam_jendela(t, cam.get("jadwal", []))
                 if t - last_hb >= 30:
-                    print(f"[HIDUP] {self.nama} frame#{i} jendela={'aktif' if aktif else 'tidur'}", flush=True)
+                    print(f"[HIDUP] {self.nama} frame#{i} jendela={'aktif' if aktif else 'tidur'} "
+                          f"gerak={n_gerak} yolo={n_yolo} frac_terakhir={last_frac:.4f}", flush=True)
                     last_hb = t
                 if not aktif or (i % self.args.every):
                     continue                                # luar jendela / bukan frame ke-N
+                if gate is not None:                        # gerbang MURAH dulu: ada gerak?
+                    gerak, last_frac = gate.ada_gerak(frame)
+                    if not gerak:
+                        deb.on_frame(False, t)              # scene diam -> tak ada orang (reset streak)
+                        continue                            # YOLO DILEWATI (hemat + redam phantom statis)
+                    n_gerak += 1
                 with self.mlock:                            # serialize akses model bersama
-                    ada = ada_person(self.model, frame, self.args.conf)
+                    ada = ada_person(self.model, frame, self.args.conf, abaikan)  # tolak box di zona abaikan
+                n_yolo += 1
                 if deb.on_frame(ada, t):
                     print(f"[GARASI:{self.nama}] orang terdeteksi @ {time.strftime('%H:%M:%S')}"
                           f"{' (dry-run)' if self.args.dry_run else ''}", flush=True)
@@ -214,9 +303,16 @@ def main():
     ap.add_argument("--cameras-file", default="cameras.json")
     ap.add_argument("--model", default="yolo11s.pt")
     ap.add_argument("--conf", type=float, default=0.35)
-    ap.add_argument("--every", type=int, default=5, help="inferensi tiap ke-N frame (fps rendah)")
+    ap.add_argument("--every", type=int, default=5, help="cek tiap ke-N frame (fps rendah)")
     ap.add_argument("--need-frames", type=int, default=3)
     ap.add_argument("--cooldown", type=float, default=60)
+    ap.add_argument("--no-motion", dest="motion", action="store_false",
+                    help="matikan gerbang gerak (YOLO tiap frame ke-N; boros + rawan phantom)")
+    ap.add_argument("--motion-area", type=float, default=0.0025,
+                    help="fraksi blob-gerak terbesar minimal utk memicu YOLO")
+    ap.add_argument("--motion-delta", type=int, default=25,
+                    help="ambang beda piksel (0-255) dianggap berubah")
+    ap.set_defaults(motion=True)
     ap.add_argument("--dry-run", action="store_true", help="deteksi + log saja, JANGAN tulis DB (uji)")
     args = ap.parse_args()
 
