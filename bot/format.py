@@ -61,9 +61,14 @@ def _episode(ev):
     return f"{lead} {label} {utama}\n{jam(ev.get('start', 0))} · {dur:.0f}s · {jalur}"
 
 
+def _garasi(ev):
+    return f"🚗 ORANG DI GARASI\n{jam(ev.get('at', 0))}"
+
+
 def caption(payload):
     match payload.get("kind"):
         case "loiter": return _loiter(payload)
         case "close": return _close(payload)
         case "episode": return _episode(payload)
+        case "garasi": return _garasi(payload)
         case _: return _transit(payload)     # keluar / masuk

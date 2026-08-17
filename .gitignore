@@ -8,6 +8,8 @@ __pycache__/
 
 # kredensial (JANGAN commit)
 .env
+# config kamera runtime — jadwal = pola kapan penghuni pergi (privasi)
+cameras.json
 
 # footage & data runtime (privasi — video rumah & aktivitas keluarga)
 out/

@@ -89,7 +89,8 @@ def keputusan_kirim(con, ev, default, rules):
 def kirim_media(con, ev):
     cap = fmt.caption(ev["payload"])
     path = None
-    if sget(con, "clip_source") == "segment":              # potong dari segmen (A/V, mulus)
+    # garasi = alur terpisah tanpa arsip sendiri -> notif TEKS (jangan potong segmen taman)
+    if ev["kind"] != "garasi" and sget(con, "clip_source") == "segment":   # potong dari segmen (A/V, mulus)
         t0, t1 = segcut.window_for(ev["payload"])
         try:
             path = segcut.cut(SEG_DIR, t0, t1, SEGCLIP_TMP, SEG_TIME)
