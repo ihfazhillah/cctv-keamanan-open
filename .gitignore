@@ -17,5 +17,9 @@ snap_*.jpg
 events-live.jsonl
 events-out.out
 episodes-live.jsonl
+# DB bersama (event rumah/keluarga — privasi)
+cctv.db
+cctv.db-wal
+cctv.db-shm
 debug.on
 debug-zona/out/

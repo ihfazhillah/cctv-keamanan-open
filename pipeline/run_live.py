@@ -33,13 +33,18 @@ import supervision as sv
 from ultralytics import YOLO
 import requests
 
+import live                        # modul (untuk mutasi live.ZONE_DEPTH via ConfigPoll)
 from live import (FrameBuffer, EpisodeTracker, consume, SENTINEL, RuleEngine,
                   PendingNotifier, TransitAggregator, notif_aktif, SceneEpisode)
 from encode import reencode_h264   # encoder auto (GPU->CPU) -> jalan juga di laptop tanpa GPU
+import db                          # penyimpanan bersama SQLite (kontrak dgn service bot)
 
 
 TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHAT_ID"]
+# TG_VIA_BOT=1 -> inti BERHENTI kirim Telegram sendiri; hanya tulis event ke DB,
+# service bot (bot/) yang mengirim + menerapkan arming. Default (unset): perilaku lama.
+TG_VIA_BOT = os.environ.get("TG_VIA_BOT") == "1"
 
 
 def jam(t):
@@ -256,6 +261,73 @@ class Arming:
         return notif_aktif(self.schedule, tags, epoch)
 
 
+class ConfigPoll:
+    """Baca config LIVE dari SQLite bersama (ditulis service bot) & terapkan ke
+    komponen inti tanpa restart — analog pola mtime arming.json, tapi via DB.
+    Semua dibungkus try/except: config rusak TAK BOLEH mematikan loop deteksi.
+    Terap hanya saat nilai berubah (idempoten). Poll tiap `interval` detik.
+
+    Kenop yang didukung (tabel settings, kecuali zone_depth):
+      det_conf -> detector.conf (dibaca per-frame)
+      loiter_s -> engine.ep_tracker.loiter_s & cat_engine.loiter_s
+      zone_depth (tabel) -> override live.ZONE_DEPTH (mutasi in-place -> menyebar
+                            ke depth_of / TrackPassageTracker / SceneEpisode)."""
+
+    def __init__(self, db_path, detector, engine, cat_engine, interval=2.0):
+        self.detector = detector
+        self.engine = engine
+        self.cat_engine = cat_engine
+        self.interval = interval
+        self.next_t = 0.0
+        self.default_depth = dict(live.ZONE_DEPTH)   # snapshot default kode (basis override)
+        self.applied = {}
+        try:
+            self.con = db.connect(db_path)
+            db.init_db(self.con)
+        except Exception as e:
+            print(f"[PERINGATAN] ConfigPoll: DB tak terbuka: {e!r}", flush=True)
+            self.con = None
+
+    def maybe(self, t):
+        if self.con is None or t < self.next_t:
+            return
+        self.next_t = t + self.interval
+        try:
+            self._apply()
+        except Exception as e:
+            print(f"[PERINGATAN] ConfigPoll gagal (diabaikan): {e!r}", flush=True)
+
+    def _apply(self):
+        st = db.all_settings(self.con)
+        if "det_conf" in st:
+            v = float(st["det_conf"])
+            if self.applied.get("det_conf") != v:
+                self.detector.conf = v
+                self.applied["det_conf"] = v
+                print(f"[CONFIG] conf -> {v}", flush=True)
+        if "loiter_s" in st:
+            v = float(st["loiter_s"])
+            if self.applied.get("loiter_s") != v:
+                self.engine.ep_tracker.loiter_s = v
+                self.cat_engine.loiter_s = v
+                self.applied["loiter_s"] = v
+                print(f"[CONFIG] loiter_s -> {v}", flush=True)
+        ov = db.get_zone_depth(self.con)
+        if self.applied.get("zone_depth") != ov:
+            baru = {**self.default_depth, **ov}
+            live.ZONE_DEPTH.clear()
+            live.ZONE_DEPTH.update(baru)             # in-place: jangan rebind (rusakkan ref bersama)
+            self.applied["zone_depth"] = dict(ov)
+            print(f"[CONFIG] zone_depth override -> {ov}", flush=True)
+
+    def close(self):
+        if self.con:
+            try:
+                self.con.close()
+            except Exception:
+                pass
+
+
 class DebugLog:
     """Diagnostik miss masuk/keluar: catat TRANSISI zona per track (person & kucing)
     -> `from -> to`, plus kelahiran track (from=∅). Dari deret ini kelihatan apakah
@@ -321,11 +393,13 @@ class ClipRecorder:
     supaya tak menahan loop deteksi."""
 
     def __init__(self, telegram, out_dir="out/live", log_path="events-live.jsonl",
-                 upload_workers=2, arming=None):
+                 upload_workers=2, arming=None, writer=None, tg_via_bot=False):
         self.tg = telegram
         self.out_dir = out_dir
         self.log_path = log_path
         self.arming = arming            # None -> selalu kirim (perilaku lama)
+        self.writer = writer            # db.EventWriter | None -> mirror event ke SQLite
+        self.tg_via_bot = tg_via_bot    # True -> jangan kirim sendiri; bot yang kirim
         # Upload dipisah ke worker pool: generate klip (ffmpeg) tetap di thread
         # konsumen, tapi upload Telegram yang lambat (retry/timeout) tak lagi
         # menahan klip berikutnya -> saat event beruntun, semua tetap terkirim.
@@ -403,6 +477,14 @@ class ClipRecorder:
 
         self._reencode(raw_name, final_name, t1 - t0)
         os.remove(raw_name)                      # raw cuma untuk reencode; final sudah tersimpan
+        # mirror ke DB (notify=1: layak diberitahu). Ditulis SELALU, apa pun mode kirim,
+        # supaya bot bisa melihatnya. arah disimpan di payload (kind/gates) untuk caption bot.
+        if self.writer:
+            self.writer.tulis(ts=self._event_time(ev), kind=ev["kind"], zone=ev.get("zone"),
+                              species=ev.get("species"), clip=os.path.basename(final_name),
+                              notify=1, payload=ev)
+        if self.tg_via_bot:
+            return                               # inti diam; service bot yang mengirim
         # jadwal arming (mode A): senyap -> klip TETAP tersimpan, upload dilewati
         if self.arming and not self.arming.should_notify(self._tags(ev), self._event_time(ev)):
             print(f"[SENYAP] notif ditahan (jadwal): {ev['kind']} {sorted(self._tags(ev))}", flush=True)
@@ -425,6 +507,11 @@ class ClipRecorder:
         # transit (keluar/masuk) = klip turunan dari passage yang SUDAH di-log -> jangan log ulang.
         if ev["kind"] not in self.TRANSIT_KINDS:
             self._log(ev)
+            # passage (MASUK/KELUAR ...) -> di-log saja, TAK di-upload (videonya lewat transit).
+            # Mirror ke DB sbg notify=0 (informasi/summary); close & loiter ditulis di _write_clip.
+            if self.writer and ev["kind"] not in self.CLIP_KINDS:
+                self.writer.tulis(ts=self._event_time(ev), kind=ev["kind"], zone=ev.get("zone"),
+                                  species=ev.get("species"), notify=0, payload=ev)
         if ev["kind"] in self.CLIP_KINDS:
             self._write_clip(ev, pending)        # close/loiter/keluar/masuk -> klip video
         # passage (KELUAR/MASUK ...) -> cuma di-log, video-nya lewat transit
@@ -523,7 +610,7 @@ class EpisodeRecorder:
 
 # ══ Orkestrasi: rangkai stage jadi satu loop pipeline ══════════════════════════
 def run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit, q,
-                 debug=None, episodes=None):
+                 debug=None, episodes=None, config=None):
     frame_no = 0
     last_hb_t = time.time()
     t = last_hb_t
@@ -539,6 +626,8 @@ def run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit
                 break
 
             frame_no += 1
+            if config:
+                config.maybe(t)                              # terap config live dari DB (throttle internal)
             clips.observe(t, frame)                          # cabang "nanti": simpan buat klip
 
             dets = detector.detect(frame)                    # cabang "sekarang": tulang punggung
@@ -607,6 +696,8 @@ def parse_args():
                         help="folder tujuan klip & snapshot (jangan tumpuk di root). Dibuat bila belum ada.")
     parser.add_argument("--arming-file", default="arming.json", type=str,
                         help="jadwal notifikasi (senyap=tetap rekam, tak kirim TG). Dibaca live; edit dari viewer.")
+    parser.add_argument("--db", default=db.DB_PATH_DEFAULT, type=str,
+                        help="path SQLite bersama (kontrak dgn service bot). Env CCTV_DB juga dihormati.")
     parser.add_argument("--debug-toggle", default="debug.on", type=str,
                         help="ADA file ini -> log transisi zona per track ke --debug-dir (diagnostik miss). on/off live.")
     parser.add_argument("--debug-dir", default="out/debug", type=str)
@@ -656,8 +747,11 @@ def main():
         transit = TransitAggregator(emit_delay=6.0, join_gap=10.0)
         q = queue.Queue()
 
+        writer = db.EventWriter(args.db)         # mirror event ke SQLite (kontrak service bot)
+        if TG_VIA_BOT:
+            print("[MODE] TG_VIA_BOT=1 -> inti tak kirim Telegram; service bot yang mengirim.", flush=True)
         recorder = ClipRecorder(Telegram(TOKEN, CHAT_ID), out_dir=args.out_dir,
-                                arming=Arming(args.arming_file))
+                                arming=Arming(args.arming_file), writer=writer, tg_via_bot=TG_VIA_BOT)
         consumer = threading.Thread(target=consume, args=(q, recorder.handle))
         consumer.start()                                     # konsumen hidup duluan
 
@@ -666,12 +760,15 @@ def main():
             out_dir=args.out_dir, pre_s=args.episode_pre)
 
         debug = DebugLog(args.debug_toggle, args.debug_dir)
+        config = ConfigPoll(args.db, detector, engine, cat_engine)   # config live dari DB (bot)
         run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit, q,
-                     debug, episodes)
+                     debug, episodes, config)
         consumer.join()
         recorder.close()          # tuntaskan upload yang masih di antrean
         if episodes:
             episodes.close()      # tuntaskan reencode episode yang masih di antrean
+        config.close()
+        writer.close()
     finally:
         source.release()
 
