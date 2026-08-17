@@ -26,6 +26,7 @@ import threading
 import subprocess
 import webbrowser
 import mimetypes
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote, unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,6 +47,7 @@ ROOT = "."
 EVENTS_PATH = "events-live.jsonl"
 MEDIA_DIR = "out/live"
 ARMING_FILE = "arming.json"
+CAMERAS_FILE = "cameras.json"
 
 EPOCH_MIN = 1_000_000_000        # ts di atas ini = wall-clock epoch (event live), bukan detik-file relatif
 CLIP_KINDS = {"close", "loiter"}
@@ -560,6 +562,60 @@ def write_arming(obj):
     Path(os.path.join(ROOT, ARMING_FILE)).write_text(json.dumps(obj, indent=2, ensure_ascii=False))
 
 
+# ══ Kamera (control plane): daftar alur + jadwal, diedit dari viewer ═════════════
+# cameras.json = sumber tunggal (dibaca run_garasi live). Skema TANPA kredensial:
+# input = NAMA stream go2rtc, bukan URL. write_cameras MENOLAK field url/user/pass.
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+PERAN_VALID = ("taman-penuh", "garasi-ringan")
+
+
+def read_cameras():
+    try:
+        return json.loads(Path(os.path.join(ROOT, CAMERAS_FILE)).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"version": 1, "kamera": []}
+
+
+def _validasi_jadwal(jadwal):
+    if not isinstance(jadwal, list):
+        raise ValueError("jadwal harus list")
+    for w in jadwal:
+        if not (_HHMM_RE.match(str(w.get("from", ""))) and _HHMM_RE.match(str(w.get("to", "")))):
+            raise ValueError("jadwal from/to harus HH:MM (24 jam)")
+        if not isinstance(w.get("aktif", True), bool):
+            raise ValueError("jadwal.aktif harus boolean")
+
+
+def write_cameras(obj):
+    """Validasi ketat + tulis cameras.json. TOLAK kredensial/URL (keamanan)."""
+    if not isinstance(obj, dict) or not isinstance(obj.get("kamera"), list):
+        raise ValueError("format cameras tidak valid (butuh {kamera:[]})")
+    for k in obj["kamera"]:
+        if any(bad in k for bad in ("url", "rtsp", "user", "pass", "password")):
+            raise ValueError("config kamera TAK BOLEH memuat kredensial/URL (pakai nama stream go2rtc)")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", str(k.get("stream", ""))):
+            raise ValueError("nama stream go2rtc tidak valid (alfanumerik/-/_ , 1–32)")
+        if not re.fullmatch(r"[A-Za-z0-9 _-]{1,40}", str(k.get("nama", ""))):
+            raise ValueError("nama kamera tidak valid")
+        if k.get("peran") not in PERAN_VALID:
+            raise ValueError(f"peran tidak dikenal (pilih {PERAN_VALID})")
+        if not isinstance(k.get("enabled", True), bool):
+            raise ValueError("enabled harus boolean")
+        _validasi_jadwal(k.get("jadwal", []))
+    obj["version"] = 1
+    Path(os.path.join(ROOT, CAMERAS_FILE)).write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def go2rtc_streams():
+    """Nama stream go2rtc (TANPA URL/kredensial) via API lokal. Gagal -> []."""
+    try:
+        with urllib.request.urlopen("http://localhost:1984/api/streams", timeout=3) as r:
+            data = json.loads(r.read().decode())
+        return sorted(data.keys()) if isinstance(data, dict) else []
+    except Exception:
+        return []
+
+
 # ══ HTTP ═══════════════════════════════════════════════════════════════════════
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -587,6 +643,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(episodes_from_qs(qs))
         elif u.path == "/api/arming":
             self._json(read_arming())
+        elif u.path == "/api/cameras":
+            self._json(read_cameras())
+        elif u.path == "/api/streams":
+            self._json({"streams": go2rtc_streams()})
         elif u.path == "/api/nvr/grab":
             self._json(nvr_grab_from_qs(qs))
         elif u.path == "/api/seg/index":
@@ -616,11 +676,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
-        if u.path == "/api/arming":
+        if u.path in ("/api/arming", "/api/cameras"):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b"{}"
+            writer = write_arming if u.path == "/api/arming" else write_cameras
             try:
-                write_arming(json.loads(body))
+                writer(json.loads(body))
                 self._json({"ok": True})
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}, code=400)
@@ -915,6 +976,7 @@ INDEX_HTML = r"""<!doctype html>
     <span class="sub">rumah · kamera depan</span>
   </div>
   <div class="spacer"></div>
+  <button class="hbtn" id="openCam">📷 Kamera</button>
   <button class="hbtn" id="openCfg">⚙ Jadwal</button>
   <div class="kpis mono">
     <div class="kpi"><b id="kTotal">0</b><span class="eyebrow">event</span></div>
@@ -988,6 +1050,18 @@ INDEX_HTML = r"""<!doctype html>
     <div id="cfgRules"></div>
     <button class="ghost" id="cfgAdd" style="margin-top:4px">+ tambah aturan</button>
     <div class="modal-foot"><span class="note" id="cfgStatus"></span><button id="cfgSave">Simpan</button></div>
+  </div>
+</div>
+
+<div class="modal" id="camModal" hidden>
+  <div class="modal-box">
+    <div class="modal-head"><h2>📷 Kamera & jadwal deteksi</h2><button class="x" id="camClose">✕</button></div>
+    <p class="note">Sumber = <b>nama stream go2rtc</b> (bukan URL/kredensial). Peran <b>garasi-ringan</b>
+       = deteksi orang bergerbang-jadwal (di luar jendela: senyap, hemat GPU). Berlaku live.</p>
+    <datalist id="streamList"></datalist>
+    <div id="camList"></div>
+    <button class="ghost" id="camAdd" style="margin-top:4px">+ tambah kamera</button>
+    <div class="modal-foot"><span class="note" id="camStatus"></span><button id="camSave">Simpan</button></div>
   </div>
 </div>
 
@@ -1472,6 +1546,79 @@ $("#cfgModal").onclick = ev => { if(ev.target === $("#cfgModal")) $("#cfgModal")
 $("#cfgAdd").onclick = () => $("#cfgRules").appendChild(ruleRow());
 $("#cfgSave").onclick = saveCfg;
 
+// ── config kamera (control plane) ──
+function jadwalRow(w){
+  w = w || {from:"22:00", to:"04:00", aktif:true};
+  const d = document.createElement("div");
+  d.className = "jwin"; d.style.cssText = "display:flex; gap:8px; align-items:center; margin:3px 0";
+  d.innerHTML = `<span class="note">dari</span><input type="time" class="jfrom" value="${w.from||"22:00"}">
+    <span class="note">sampai</span><input type="time" class="jto" value="${w.to||"04:00"}">
+    <label class="note"><input type="checkbox" class="jaktif"${w.aktif!==false?" checked":""}> aktif</label>
+    <button class="delrule jdel" title="hapus jendela">✕</button>`;
+  d.querySelector(".jdel").onclick = () => d.remove();
+  return d;
+}
+function camRow(k){
+  k = k || {nama:"", stream:"", peran:"garasi-ringan", enabled:true, jadwal:[]};
+  const div = document.createElement("div");
+  div.className = "camitem";
+  div.innerHTML = `
+    <div class="rule" style="grid-template-columns:1fr 1fr 128px 66px 32px">
+      <input class="cnama" placeholder="nama (mis. garasi)" value="${k.nama||""}">
+      <input class="cstream" list="streamList" placeholder="stream go2rtc" value="${k.stream||""}">
+      <select class="cperan">
+        <option value="garasi-ringan"${k.peran!=="taman-penuh"?" selected":""}>garasi-ringan</option>
+        <option value="taman-penuh"${k.peran==="taman-penuh"?" selected":""}>taman-penuh</option>
+      </select>
+      <label class="note" style="text-align:center"><input type="checkbox" class="cen"${k.enabled!==false?" checked":""}> aktif</label>
+      <button class="delrule cdel" title="hapus kamera">✕</button>
+    </div>
+    <div class="cjadwal" style="margin:0 0 6px 10px"></div>
+    <button class="ghost cjadd" style="margin:0 0 14px 10px; padding:4px 10px; font-size:12px">+ jendela waktu</button>`;
+  const jbox = div.querySelector(".cjadwal");
+  (k.jadwal||[]).forEach(w => jbox.appendChild(jadwalRow(w)));
+  div.querySelector(".cjadd").onclick = () => jbox.appendChild(jadwalRow());
+  div.querySelector(".cdel").onclick = () => div.remove();
+  return div;
+}
+async function openCam(){
+  const cfg = await (await fetch("/api/cameras")).json();
+  let streams = [];
+  try { streams = (await (await fetch("/api/streams")).json()).streams || []; } catch(e){}
+  $("#streamList").innerHTML = streams.map(s => `<option value="${s}">`).join("");
+  const box = $("#camList"); box.innerHTML = "";
+  const list = cfg.kamera && cfg.kamera.length ? cfg.kamera : [null];
+  list.forEach(k => box.appendChild(camRow(k)));
+  $("#camStatus").textContent = "";
+  $("#camModal").hidden = false;
+}
+function collectCam(){
+  const kamera = [...$("#camList").children].map(div => ({
+    nama: div.querySelector(".cnama").value.trim(),
+    stream: div.querySelector(".cstream").value.trim(),
+    peran: div.querySelector(".cperan").value,
+    enabled: div.querySelector(".cen").checked,
+    jadwal: [...div.querySelectorAll(".jwin")].map(j => ({
+      from: j.querySelector(".jfrom").value || "00:00",
+      to: j.querySelector(".jto").value || "23:59",
+      aktif: j.querySelector(".jaktif").checked })),
+  })).filter(k => k.nama && k.stream);
+  return { version: 1, kamera };
+}
+async function saveCam(){
+  const st = $("#camStatus"); st.textContent = "menyimpan…";
+  try {
+    const r = await (await fetch("/api/cameras", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(collectCam())})).json();
+    st.textContent = r.ok ? "tersimpan ✓ — berlaku live (garasi baca ulang jadwal)" : "gagal: " + r.error;
+  } catch(e){ st.textContent = "error: " + e; }
+}
+$("#openCam").onclick = openCam;
+$("#camClose").onclick = () => $("#camModal").hidden = true;
+$("#camModal").onclick = ev => { if(ev.target === $("#camModal")) $("#camModal").hidden = true; };
+$("#camAdd").onclick = () => $("#camList").appendChild(camRow());
+$("#camSave").onclick = saveCam;
+
 loadMeta().then(fetchData);
 </script>
 </body>
@@ -1501,12 +1648,13 @@ def find_app_browser():
 
 
 def main():
-    global ROOT, EVENTS_PATH, MEDIA_DIR, ARMING_FILE
+    global ROOT, EVENTS_PATH, MEDIA_DIR, ARMING_FILE, CAMERAS_FILE
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".", help="folder berisi events-live.jsonl & out/live")
     ap.add_argument("--events", default="events-live.jsonl")
     ap.add_argument("--media-dir", default="out/live")
     ap.add_argument("--arming-file", default="arming.json")
+    ap.add_argument("--cameras-file", default="cameras.json")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", default=8477, type=int, help="port pilihan (kalau sibuk, dipilih otomatis)")
     ap.add_argument("--no-open", action="store_true",
@@ -1526,6 +1674,7 @@ def main():
     EVENTS_PATH = args.events
     MEDIA_DIR = args.media_dir
     ARMING_FILE = args.arming_file
+    CAMERAS_FILE = args.cameras_file
     load_nvr(ROOT, args.nvr_track, args.nvr_dir, args.nvr_max_seconds)
     load_segrec(ROOT, args.seg_dir, args.seg_clip_dir, args.seg_max_seconds)
 
