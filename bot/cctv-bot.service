@@ -3,8 +3,8 @@ Description=CCTV Telegram bot (kontrol arming + notifikasi)
 After=network-online.target
 
 [Service]
-WorkingDirectory=/home/USER/Dev/cctv-keamanan-open
-ExecStart=/home/USER/.local/bin/uv run --env-file .env bot/run_bot.py
+WorkingDirectory=%h/Dev/cctv-keamanan-open
+ExecStart=%h/.local/bin/uv run --env-file .env bot/run_bot.py
 Restart=always
 RestartSec=3
 TimeoutStopSec=15

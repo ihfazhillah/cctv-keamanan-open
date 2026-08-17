@@ -3,8 +3,8 @@ Description=CCTV shadow segment recorder (A/V, proof-of-concept)
 After=network-online.target
 
 [Service]
-WorkingDirectory=/home/USER/Dev/cctv-keamanan-open
-ExecStart=/home/USER/.local/bin/uv run --env-file .env segrec/run_segrec.py
+WorkingDirectory=%h/Dev/cctv-keamanan-open
+ExecStart=%h/.local/bin/uv run --env-file .env segrec/run_segrec.py
 Restart=always
 RestartSec=3
 TimeoutStopSec=15

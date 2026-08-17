@@ -197,7 +197,7 @@ uv run --env-file .env bot/run_bot.py
    Sejak itu inti diam; hanya bot yang mengirim + menerapkan arming.
 3. Pasang service bot:
    ```bash
-   ln -s /home/USER/Dev/cctv-keamanan-open/bot/cctv-bot.service \
+   ln -s ~/Dev/cctv-keamanan-open/bot/cctv-bot.service \
          ~/.config/systemd/user/cctv-bot.service
    systemctl --user daemon-reload && systemctl --user enable --now cctv-bot
    ```
