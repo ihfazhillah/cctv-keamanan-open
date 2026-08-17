@@ -867,6 +867,15 @@ INDEX_HTML = r"""<!doctype html>
 
   .console { display:grid; grid-template-columns:minmax(420px,44%) 1fr; height:calc(100vh - 55px); }
   @media (max-width:900px){ .console{ grid-template-columns:1fr; height:auto; } }
+  .console.livefull { grid-template-columns:1fr; }        /* Live: grid pakai LEBAR PENUH */
+  .console.livefull .left { display:none; }
+  #liveBar { position:fixed; top:60px; left:14px; z-index:30; display:none; gap:6px;
+    background:rgba(15,20,28,.72); -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
+    border:1px solid rgba(255,255,255,.14); padding:5px; border-radius:11px; box-shadow:0 6px 22px rgba(0,0,0,.35); }
+  #liveBar.show { display:flex; }
+  #liveBar button { background:transparent; color:#cdd6e0; border:0; border-radius:7px; padding:6px 13px; font-weight:600; cursor:pointer; font-size:13px; }
+  #liveBar button:hover { background:rgba(255,255,255,.08); }
+  #liveBar button.on { background:var(--accent); color:#fff; }
 
   .left { display:flex; flex-direction:column; border-right:1px solid var(--line); min-height:0; }
   .filters { padding:12px 14px; background:var(--panel); border-bottom:1px solid var(--line); display:flex; flex-direction:column; gap:10px; }
@@ -1012,6 +1021,13 @@ INDEX_HTML = r"""<!doctype html>
     <div class="kpi"><b id="kClips">0</b><span class="eyebrow">klip</span></div>
   </div>
 </header>
+
+<div id="liveBar">
+  <button data-m="event">Event</button>
+  <button data-m="episode">Episode</button>
+  <button data-m="arsip">Arsip</button>
+  <button data-m="live" class="on">Live</button>
+</div>
 
 <div class="console">
   <div class="left">
@@ -1534,6 +1550,8 @@ function setMode(m){
   $("#playAll").hidden = m!=="event";
   $("#stage").className = m==="live" ? "stage livewrap" : "stage";      // grid live = tanpa bingkai kartu
   document.querySelector(".log").hidden = (m==="live");                  // live pakai grid, bukan tabel
+  document.querySelector(".console").classList.toggle("livefull", m==="live");  // grid LEBAR PENUH
+  $("#liveBar").classList.toggle("show", m==="live");                    // bar navigasi mengambang
   selId = null; SELE = null; killHls();
   $("#detailWrap").innerHTML = ""; $("#nvrWrap").innerHTML = "";
   const label = m==="episode" ? "episode" : m==="arsip" ? "jam arsip" : m==="live" ? "kamera live" : "event";
@@ -1549,6 +1567,7 @@ $("#day").onchange = refresh;
 ["zone","mediaOnly","cam"].forEach(id => $("#"+id).onchange = fetchEvents);
 $("#gap").oninput = () => { clearTimeout(t); t = setTimeout(fetchEpisodes, 250); };
 $("#modeSeg").addEventListener("click", ev => { const b = ev.target.closest("button"); if(b) setMode(b.dataset.m); });
+$("#liveBar").addEventListener("click", ev => { const b = ev.target.closest("button"); if(b) setMode(b.dataset.m); });
 $("#kindChips").addEventListener("click", ev => {
   const b = ev.target.closest(".chip"); if(!b) return;
   const k = b.dataset.k, on = b.getAttribute("aria-pressed")==="true";
