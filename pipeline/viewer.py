@@ -746,6 +746,9 @@ class Handler(BaseHTTPRequestHandler):
         body = INDEX_HTML.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        # JS inline di HTML ini -> JANGAN cache, biar reload/buka-app selalu dapat
+        # versi terbaru (mencegah JS basi mis. openInArsip lama yg seek-HLS drift).
+        self.send_header("Cache-Control", "no-cache, must-revalidate")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if self.command != "HEAD":
@@ -1538,7 +1541,7 @@ function renderStage(e, playlistMode){
 }
 
 function arsipBtn(ts){   // tombol 'buka di arsip' bila arsip aktif & event punya jam nyata
-  return (META.segrec && ts > 1e9) ? `<button class="ghost" id="toArsip" style="margin-top:10px">▶ buka di arsip (jam penuh)</button>` : "";
+  return (META.segrec && ts > 1e9) ? `<button class="ghost" id="toArsip" style="margin-top:10px">▶ buka momen di arsip</button>` : "";
 }
 function wireArsipBtn(ts, camera){ const b = $("#toArsip"); if(b) b.onclick = () => openInArsip(ts, camera); }
 function renderDetail(e){
