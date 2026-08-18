@@ -1,4 +1,4 @@
-from collections import deque
+from collections import deque, Counter
 import queue
 import threading
 import time
@@ -529,6 +529,7 @@ class SceneEpisode:
         self.last_active_t = None    # kapan terakhir ADA zona terisi
         self.order = []              # zona sesuai urutan kemunculan pertama
         self._seen = set()
+        self.count = Counter()       # frame-per-zona (utk deteksi 'dominan di luar')
 
     def update(self, occupied, t):
         """occupied = set nama zona yang berisi orang di frame ini. -> list event."""
@@ -574,6 +575,7 @@ class SceneEpisode:
     def _catat(self, occupied):
         # rekam zona baru sesuai urutan muncul; urut kedalaman saat sefrekuensi -> deterministik
         for zone in sorted(occupied, key=depth_of):
+            self.count[zone] += 1                # hitung kehadiran per zona (utk dominan-luar)
             if zone not in self._seen:
                 self._seen.add(zone)
                 self.order.append(zone)
@@ -583,6 +585,14 @@ class SceneEpisode:
                 "arah": self._arah(), "gates": list(self.order), "zona": sorted(self._seen)}
 
     def _arah(self):
+        # DOMINAN DI LUAR: bila kehadiran mayoritas di jalan-utama (LUAR), ini PELEWAT
+        # jalan, BUKAN masuk/keluar. Occlusion di batas pagar bikin anchor separuh-badan
+        # (orang di jalan, terhalang) jitter ke zona-dalam beberapa frame -> jangan
+        # terkecoh: bandingkan total frame luar vs dalam. (regresi: episode #2691).
+        luar = sum(c for z, c in self.count.items() if z in LUAR)
+        dalam = sum(c for z, c in self.count.items() if z not in LUAR)
+        if luar > dalam:
+            return "lewat"
         if len(self.order) < 2:
             return "lewat"
         depths = [depth_of(z) for z in self.order]

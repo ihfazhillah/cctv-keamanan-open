@@ -113,6 +113,29 @@ def main():
          "zona": ["pintu", "taman", "teras"]},
     ]))
 
+    # E10) DOMINAN DI LUAR: orang di jalan-utama (terhalang pagar), anchor separuh-badan
+    #      jitter sekejap ke dekat-kolam. Kehadiran luar(4) > dalam(1) -> 'lewat', BUKAN
+    #      masuk. Regresi false-positive #2691 (pelewat jalan dikira masuk properti).
+    out = run([(0.0, {"jalan-utama"}), (1.0, {"jalan-utama"}), (2.0, {"dekat-kolam"}),
+               (3.0, {"jalan-utama"}), (4.0, {"jalan-utama"}), (5.0, {}), (9.0, {})])
+    results.append(check("E10 dominan jalan-utama + blip dekat-kolam -> lewat (bukan masuk)", out, [
+        {"kind": "episode_mulai", "at": 0.0},
+        {"kind": "episode", "start": 0.0, "end": 4.0, "arah": "lewat",
+         "gates": ["jalan-utama", "dekat-kolam"],
+         "zona": ["dekat-kolam", "jalan-utama"]},
+    ]))
+
+    # E11) MASUK sah TETAP masuk: sebentar di jalan-utama lalu benar-benar masuk ke dalam
+    #      (dalam menang) -> 'masuk' tak ikut tertekan aturan dominan-luar.
+    out = run([(0.0, {"jalan-utama"}), (1.0, {"jalan-masuk"}), (2.0, {"taman"}),
+               (3.0, {"teras"}), (4.0, {"pintu"}), (5.0, {"pintu"}), (6.0, {}), (10.0, {})])
+    results.append(check("E11 jalan-utama sekejap lalu masuk dalam -> masuk", out, [
+        {"kind": "episode_mulai", "at": 0.0},
+        {"kind": "episode", "start": 0.0, "end": 5.0, "arah": "masuk",
+         "gates": ["jalan-utama", "jalan-masuk", "taman", "teras", "pintu"],
+         "zona": ["jalan-masuk", "jalan-utama", "pintu", "taman", "teras"]},
+    ]))
+
     print()
     if all(results):
         print(f"ALL PASS ({len(results)}/{len(results)})")
