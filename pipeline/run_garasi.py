@@ -7,9 +7,11 @@ cameras.json (dari viewer/Telegram) -> supervisor start worker-nya LIVE, tanpa
 systemctl. Model YOLO DIBAGI semua worker (satu load VRAM; predict di-serialize).
 
 Tiap worker: baca stream go2rtc (nama, bukan URL berkredensial), deteksi kelas
-`person` (yolo11s, tanpa tracker), dan HANYA di dalam jendela jadwal -> event
-`garasi` (tag camera) ke cctv.db (notify=1) -> bot kirim notif. Di luar jendela:
-worker hidup, lewati inferensi (hemat GPU). Jadwal/enabled dibaca LIVE (mtime).
+`person` (yolo11s) + tripwire garis (bila ada) -> event `garasi` (tag camera) ke
+cctv.db. Deteksi jalan 24/7 (seperti taman); `jadwal` = gerbang NOTIF saja: di
+dalam jendela notify=1 (bot kirim), di luar notify=0 (tetap tercatat+berklip di
+viewer, senyap). MotionGate tetap melewati inferensi saat scene DIAM (hemat GPU).
+Jadwal/enabled/garis dibaca LIVE (mtime). Rekam ⊥ notif.
 
     uv run --env-file .env pipeline/run_garasi.py --cameras-file cameras.json
 
@@ -373,13 +375,13 @@ class Worker(threading.Thread):
                     print(f"[GARASI:{self.nama}] garis_periksa berubah -> {len(trips)} garis "
                           + (",".join(n for _, _, n in trips) if trips else "(kosong)"), flush=True)
                 i += 1
-                aktif = dalam_jendela(t, cam.get("jadwal", []))
+                notif = dalam_jendela(t, cam.get("jadwal", []))   # jadwal = gerbang NOTIF (deteksi jalan 24/7)
                 if t - last_hb >= 30:
-                    print(f"[HIDUP] {self.nama} frame#{i} jendela={'aktif' if aktif else 'tidur'} "
+                    print(f"[HIDUP] {self.nama} frame#{i} notif={'aktif' if notif else 'senyap'} "
                           f"gerak={n_gerak} yolo={n_yolo} frac_terakhir={last_frac:.4f}", flush=True)
                     last_hb = t
-                if not aktif or (i % self.args.every):
-                    continue                                # luar jendela / bukan frame ke-N
+                if i % self.args.every:
+                    continue                                # sampling frame ke-N (deteksi TETAP 24/7 spt taman)
                 if gate is not None:                        # gerbang MURAH dulu: ada gerak?
                     gerak, last_frac = gate.ada_gerak(frame)
                     if not gerak:
@@ -397,7 +399,7 @@ class Worker(threading.Thread):
                                 print(f"[GARASI:{self.nama}] LINTAS {nama}/{label} (track#{tid}) @ "
                                       f"{time.strftime('%H:%M:%S')}{' (dry-run)' if self.args.dry_run else ''}", flush=True)
                                 if self.writer:
-                                    self.writer.tulis(ts=t, kind="garasi", zone=nama, notify=1,
+                                    self.writer.tulis(ts=t, kind="garasi", zone=nama, notify=notif,
                                                       payload={"kind": "garasi", "camera": self.nama, "at": t,
                                                                "arah": label, "lintas": True, "garis": nama})
                         trip.prune(t)
@@ -409,7 +411,7 @@ class Worker(threading.Thread):
                     print(f"[GARASI:{self.nama}] orang terdeteksi @ {time.strftime('%H:%M:%S')}"
                           f"{' (dry-run)' if self.args.dry_run else ''}", flush=True)
                     if self.writer:
-                        self.writer.tulis(ts=t, kind="garasi", notify=1,
+                        self.writer.tulis(ts=t, kind="garasi", notify=notif,
                                           payload={"kind": "garasi", "camera": self.nama, "at": t})
         finally:
             source.release()
