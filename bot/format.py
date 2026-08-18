@@ -62,6 +62,10 @@ def _episode(ev):
 
 
 def _garasi(ev):
+    if ev.get("lintas") and ev.get("arah"):
+        garis = ev.get("garis")
+        inti = f"{ev['arah']} garis {garis}" if garis else f"lintas {ev['arah']}"
+        return f"🚶 GARASI — {inti}\n{jam(ev.get('at', 0))}"
     return f"🚗 ORANG DI GARASI\n{jam(ev.get('at', 0))}"
 
 

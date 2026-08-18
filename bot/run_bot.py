@@ -36,6 +36,8 @@ OUT_DIR = os.environ.get("CCTV_OUT_DIR", "out/live")
 ZONE_FILE = os.environ.get("CCTV_ZONE_FILE", "zones-102.json")
 SEG_DIR = os.environ.get("SEG_DIR", "out/segments")
 SEG_TIME = int(os.environ.get("SEG_TIME", "4"))
+GARASI_PRE = float(os.environ.get("GARASI_PRE", "6"))     # padding klip garasi (detik) sebelum event
+GARASI_POST = float(os.environ.get("GARASI_POST", "10"))  # ...dan sesudah (tunggu post-roll terekam)
 SEGCLIP_TMP = os.environ.get("SEGCLIP_TMP", "out/segclip-send.mp4")
 POLL_INTERVAL = float(os.environ.get("BOT_POLL_S", "3"))
 HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
@@ -127,23 +129,57 @@ def keputusan_kirim(con, ev, default, rules):
     return "sent"
 
 
+def _seg_dir_kamera(cam):
+    """Folder segmen milik `cam` (segrec menulis out/segments/<cam>/). CATATAN deploy:
+    SEG_DIR sering menunjuk subdir taman (mis. out/segments/taman) utk fitur klip taman.
+    Coba SEG_DIR/<cam>, lalu INDUK SEG_DIR/<cam>, lalu root default -> ambil yg ADA.
+    Tanpa ini, klip garasi dicari di out/segments/taman/garasi (tak ada) -> jatuh teks."""
+    cam = os.path.basename(cam or "")
+    for base in (SEG_DIR, os.path.dirname(SEG_DIR), "out/segments"):
+        d = os.path.join(base, cam)
+        if os.path.isdir(d):
+            return d
+    return os.path.join(SEG_DIR, cam)
+
+
+def _garasi_belum_siap(ev):
+    """Klip garasi dipotong dari arsipnya sendiri (out/segments/<cam>) -> butuh post-roll
+    sudah terekam. True bila event masih terlalu baru -> TUNDA kirim (jangan log skip)
+    sampai segmen post-roll ada. Berbasis waktu (bukan cek berkas) -> tak stall selamanya
+    kalau segrec mati (nanti jatuh ke notif teks)."""
+    if ev["kind"] != "garasi":
+        return False
+    at = ev["payload"].get("at", ev["ts"])
+    return time.time() < at + GARASI_POST + SEG_TIME + 1
+
+
 def kirim_media(con, ev):
-    cap = fmt.caption(ev["payload"])
+    p = ev["payload"]
+    cap = fmt.caption(p)
     path = None
-    # garasi = alur terpisah tanpa arsip sendiri -> notif TEKS (jangan potong segmen taman)
-    if ev["kind"] != "garasi" and sget(con, "clip_source") == "segment":   # potong dari segmen (A/V, mulus)
-        t0, t1 = segcut.window_for(ev["payload"])
+    if ev["kind"] == "garasi":                             # garasi PUNYA arsip sendiri (rekam:true)
+        cam = os.path.basename(p.get("camera") or "")      # basename = anti-traversal
+        if cam:
+            t0, t1 = segcut.window_for(p, pre=GARASI_PRE, post=GARASI_POST)
+            try:                                            # potong dari out/segments/<cam> (A/V, mulus)
+                path = segcut.cut(_seg_dir_kamera(cam), t0, t1, SEGCLIP_TMP, SEG_TIME)
+            except Exception as e:
+                print(f"[SEGCUT] garasi gagal potong ({e!r}) -> notif teks", flush=True)
+    elif sget(con, "clip_source") == "segment":            # taman: potong dari segmen (A/V, mulus)
+        t0, t1 = segcut.window_for(p)
         try:
             path = segcut.cut(SEG_DIR, t0, t1, SEGCLIP_TMP, SEG_TIME)
         except Exception as e:
             print(f"[SEGCUT] gagal potong ({e!r}) -> fallback klip pipeline", flush=True)
     if path is None:                                        # fallback: klip pipeline out/live
         clip = ev.get("clip")
-        p = os.path.join(OUT_DIR, clip) if clip else None
-        path = p if (p and os.path.exists(p)) else None
+        pth = os.path.join(OUT_DIR, clip) if clip else None
+        path = pth if (pth and os.path.exists(pth)) else None
     if path and os.path.exists(path):
+        print(f"[MEDIA] {ev['kind']}#{ev['id']} -> VIDEO {path} ({os.path.getsize(path)}B)", flush=True)
         with open(path, "rb") as f:
             return bot.send_video(CHAT_ID, f, caption=cap, timeout=180)
+    print(f"[MEDIA] {ev['kind']}#{ev['id']} -> TEKS (klip tak ada)", flush=True)
     return bot.send_message(CHAT_ID, cap)      # klip tak ada -> tetap kabari via teks
 
 
@@ -157,6 +193,8 @@ def putaran_kirim():
             rules = db.list_arming_rules(con, only_enabled=True)
             for ev in db.unsent_events(con, limit=20):
                 status = keputusan_kirim(con, ev, default, rules)
+                if status == "sent" and _garasi_belum_siap(ev):
+                    continue                     # tunda (post-roll belum lengkap) -> JANGAN log, coba lagi
                 if status != "sent":
                     db.log_send(con, ev["id"], status)
                     print(f"[SKIP:{status}] event#{ev['id']} {ev['kind']}", flush=True)

@@ -638,6 +638,36 @@ def _validasi_jadwal(jadwal):
             raise ValueError("jadwal.aktif harus boolean")
 
 
+def _validasi_satu_garis(gp):
+    """Satu tripwire berarah. Koordinat FRAKSI [0..1] (bebas-resolusi, dipetakan ke
+    frame nyata saat runtime seperti `abaikan`). label.maju/mundur = nama arah sisi
+    normal + / −. nama (opsional) = penanda garis mana yg diseberangi."""
+    if not isinstance(gp, dict):
+        raise ValueError("garis_periksa harus objek {garis,label}")
+    g = gp.get("garis")
+    if not (isinstance(g, list) and len(g) == 2):
+        raise ValueError("garis_periksa.garis harus 2 titik [[x1,y1],[x2,y2]]")
+    for p in g:
+        if not (isinstance(p, (list, tuple)) and len(p) == 2):
+            raise ValueError("titik garis harus [x,y]")
+        for v in p:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not (0.0 <= v <= 1.0):
+                raise ValueError("koordinat garis harus fraksi 0..1")
+    if g[0][0] == g[1][0] and g[0][1] == g[1][1]:
+        raise ValueError("dua titik garis tak boleh sama (garis nol-panjang)")
+    lab = gp.get("label", {})
+    if not isinstance(lab, dict):
+        raise ValueError("garis_periksa.label harus objek {maju, mundur}")
+
+
+def _validasi_garis(gp):
+    """garis_periksa (opsional): satu objek (legacy) ATAU list objek (banyak garis)."""
+    if gp is None:
+        return
+    for satu in (gp if isinstance(gp, list) else [gp]):
+        _validasi_satu_garis(satu)
+
+
 def write_cameras(obj):
     """Validasi ketat + tulis cameras.json. TOLAK kredensial/URL (keamanan)."""
     if not isinstance(obj, dict) or not isinstance(obj.get("kamera"), list):
@@ -654,6 +684,8 @@ def write_cameras(obj):
         if not isinstance(k.get("enabled", True), bool):
             raise ValueError("enabled harus boolean")
         _validasi_jadwal(k.get("jadwal", []))
+        if "garis_periksa" in k:
+            _validasi_garis(k["garis_periksa"])
     obj["version"] = 1
     Path(os.path.join(ROOT, CAMERAS_FILE)).write_text(json.dumps(obj, indent=2, ensure_ascii=False))
 
@@ -666,6 +698,28 @@ def go2rtc_streams():
         return sorted(data.keys()) if isinstance(data, dict) else []
     except Exception:
         return []
+
+
+def go2rtc_frame(stream):
+    """JPEG snapshot SATU frame dari go2rtc (proxy sisi-server -> gambar same-origin,
+    jadi canvas editor garis TAK ter-taint & bebas isu CORS). None bila go2rtc mati /
+    stream tak ada. stream = nama go2rtc (bukan URL berkredensial)."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", stream or ""):
+        return None
+    try:
+        with urllib.request.urlopen(
+                f"http://localhost:1984/api/frame.jpeg?src={quote(stream)}", timeout=6) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
+def _stream_of(camera):
+    """nama stream go2rtc utk kamera bernama `camera` (dari cameras.json), atau None."""
+    for k in read_cameras().get("kamera", []):
+        if k.get("nama") == camera:
+            return k.get("stream")
+    return None
 
 
 # ══ HTTP ═══════════════════════════════════════════════════════════════════════
@@ -699,6 +753,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(read_cameras())
         elif u.path == "/api/streams":
             self._json({"streams": go2rtc_streams()})
+        elif u.path == "/api/frame":
+            self._frame(qs)
         elif u.path == "/api/nvr/grab":
             self._json(nvr_grab_from_qs(qs))
         elif u.path == "/api/seg/index":
@@ -801,6 +857,23 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     break
                 remaining -= len(chunk)
+
+    def _frame(self, qs):
+        """Snapshot JPEG kamera (proxy go2rtc) utk editor garis. camera -> stream via
+        cameras.json (bukan src bebas). 502 bila go2rtc mati / stream tak ada."""
+        cam = qs.get("camera", [""])[0]
+        stream = _stream_of(cam)
+        img = go2rtc_frame(stream) if stream else None
+        if not img:
+            self.send_error(502, "frame tak tersedia (go2rtc mati / kamera tak dikenal)")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(img)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(img)
 
     def _seg_hls(self, qs):
         camera = qs.get("camera", [""])[0]; day = qs.get("day", [""])[0]; hour = qs.get("hour", [""])[0]
@@ -1047,6 +1120,19 @@ INDEX_HTML = r"""<!doctype html>
   .modal-foot { display:flex; align-items:center; gap:12px; margin-top:14px; }
   .modal-foot button:not(.ghost) { margin-left:auto; }
   .rule-head { display:grid; grid-template-columns:1fr 92px 92px 96px 32px; gap:8px; font-size:10.5px; color:var(--faint); text-transform:uppercase; letter-spacing:.06em; margin:8px 0 4px; }
+
+  /* editor garis periksa (tripwire) */
+  .grswrap { position:relative; background:var(--screen); border:1px solid var(--line); border-radius:10px; overflow:hidden; display:flex; align-items:center; justify-content:center; min-height:220px; }
+  .grswrap canvas { display:block; max-width:100%; height:auto; cursor:crosshair; touch-action:none; }
+  .grshint { position:absolute; color:var(--faint); font-size:12.5px; pointer-events:none; text-align:center; padding:0 20px; }
+  #grsCoord { color:var(--dim); font-size:12px; }
+  .grsrow { display:grid; grid-template-columns:16px 1.3fr 1fr 1fr 34px 32px; gap:7px; align-items:center;
+            padding:5px 6px; border:1px solid var(--line); border-radius:8px; cursor:pointer; }
+  .grsrow.act { border-color:var(--accent); background:var(--accent-weak); }
+  .grsrow input { padding:5px 7px; font-size:12.5px; }
+  .grsswatch { width:14px; height:14px; border-radius:4px; border:1px solid rgba(0,0,0,.25); }
+  .grsrow .grsredraw { padding:5px 6px; font-size:13px; }
+  .grsrow .grsdel { background:transparent; border:1px solid var(--line); color:var(--ev-exit); padding:4px 7px; }
 </style>
 </head>
 <body>
@@ -1058,6 +1144,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <div class="spacer"></div>
   <button class="hbtn" id="openCam">📷 Kamera</button>
+  <button class="hbtn" id="openGaris">📐 Garis</button>
   <button class="hbtn" id="openCfg">⚙ Jadwal</button>
   <div class="kpis mono">
     <div class="kpi"><b id="kTotal">0</b><span class="eyebrow">event</span></div>
@@ -1153,6 +1240,29 @@ INDEX_HTML = r"""<!doctype html>
     <div id="camList"></div>
     <button class="ghost" id="camAdd" style="margin-top:4px">+ tambah kamera</button>
     <div class="modal-foot"><span class="note" id="camStatus"></span><button id="camSave">Simpan</button></div>
+  </div>
+</div>
+
+<div class="modal" id="garisModal" hidden>
+  <div class="modal-box" style="width:min(880px,96vw)">
+    <div class="modal-head"><h2>📐 Garis periksa (tripwire)</h2><button class="x" id="garisClose">✕</button></div>
+    <p class="note"><b>＋ garis baru</b>, lalu klik <b>dua titik</b> di frame. Bisa <b>beberapa garis</b> (mis. gerbang &
+      jalan-samping). Orang yang <b>titik kakinya</b> menyeberang garis → event <b>berarah</b> + klip. Panah = sisi
+      <b>maju</b>. Tiap garis: beri <b>nama</b> + label arah. Koordinat disimpan <b>fraksi</b> (bebas-resolusi).</p>
+    <div class="frow" style="max-width:620px; margin-bottom:10px">
+      <select id="grsCam" aria-label="Kamera garasi"></select>
+      <button class="ghost" id="grsReload">↻ muat ulang frame</button>
+      <button id="grsAddLine">＋ garis baru</button>
+    </div>
+    <div class="grswrap" id="grsWrap">
+      <canvas id="grsCanvas" width="800" height="450"></canvas>
+      <div class="grshint" id="grsHint">memuat frame…</div>
+    </div>
+    <div class="note" id="grsCoord" style="margin-top:8px"></div>
+    <div id="grsList" style="margin-top:10px; display:flex; flex-direction:column; gap:8px"></div>
+    <div class="modal-foot"><span class="note" id="grsStatus"></span>
+      <button class="ghost" id="grsCopy">⧉ salin JSON</button>
+      <button id="grsSave">Simpan ke kamera</button></div>
   </div>
 </div>
 
@@ -1762,6 +1872,163 @@ $("#camClose").onclick = () => $("#camModal").hidden = true;
 $("#camModal").onclick = ev => { if(ev.target === $("#camModal")) $("#camModal").hidden = true; };
 $("#camAdd").onclick = () => $("#camList").appendChild(camRow());
 $("#camSave").onclick = saveCam;
+
+// ── editor garis periksa (tripwire berarah, BANYAK garis) ──
+const GRS_COLORS = ["#ffd34d", "#4ea3d9", "#3fbf87", "#e8746b", "#b088e0", "#e0a44a"];
+let grsLines = [], grsActive = -1, grsImg = null, grsCams = [];
+const grsColor = i => GRS_COLORS[i % GRS_COLORS.length];
+
+function grsJson(){
+  return grsLines.filter(l => l.pts.length === 2).map((l, i) => ({
+    nama: l.nama.trim() || ("garis" + (i + 1)),
+    garis: l.pts.map(p => [Math.round(p[0]*1000)/1000, Math.round(p[1]*1000)/1000]),
+    label: { maju: l.maju.trim(), mundur: l.mundur.trim() },
+  }));
+}
+function grsRedraw(){
+  const c = $("#grsCanvas"), ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, c.width, c.height);
+  if(grsImg) ctx.drawImage(grsImg, 0, 0, c.width, c.height);
+  grsLines.forEach((l, i) => {
+    const col = grsColor(i), act = (i === grsActive);
+    const P = l.pts.map(p => ({ x: p[0]*c.width, y: p[1]*c.height }));
+    if(P.length === 2){
+      ctx.lineWidth = act ? 4 : 3; ctx.strokeStyle = col; ctx.fillStyle = col;
+      ctx.beginPath(); ctx.moveTo(P[0].x, P[0].y); ctx.lineTo(P[1].x, P[1].y); ctx.stroke();
+      const mx = (P[0].x+P[1].x)/2, my = (P[0].y+P[1].y)/2;              // panah NORMAL(+90°) = sisi maju
+      const dx = P[1].x-P[0].x, dy = P[1].y-P[0].y, L = Math.hypot(dx, dy) || 1;
+      const nx = -dy/L, ny = dx/L, al = 34, ex = mx+nx*al, ey = my+ny*al;
+      ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(ex, ey); ctx.stroke();
+      const a = Math.atan2(ny, nx);
+      ctx.beginPath(); ctx.moveTo(ex, ey);
+      ctx.lineTo(ex-10*Math.cos(a-0.4), ey-10*Math.sin(a-0.4));
+      ctx.lineTo(ex-10*Math.cos(a+0.4), ey-10*Math.sin(a+0.4)); ctx.closePath(); ctx.fill();
+      ctx.font = "700 12px system-ui"; ctx.fillStyle = col;
+      const nm = l.nama.trim() || ("garis" + (i + 1));
+      ctx.fillText(nm + (l.maju.trim() ? " ▸" + l.maju.trim() : ""), ex + 6, ey + 4);
+    }
+    P.forEach((p, j) => {
+      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(p.x, p.y, act ? 6 : 5, 0, 7); ctx.fill();
+      ctx.fillStyle = "#000"; ctx.font = "700 10px system-ui"; ctx.fillText(j===0?"A":"B", p.x-3, p.y+4);
+    });
+  });
+  const al = grsLines[grsActive];
+  const siap = grsLines.filter(l => l.pts.length === 2).length;
+  $("#grsCoord").textContent = grsActive < 0 ? "Tekan ＋ garis baru lalu klik 2 titik di frame."
+    : !al ? "" : al.pts.length === 0 ? `menggambar garis #${grsActive+1}: klik titik A`
+    : al.pts.length === 1 ? `garis #${grsActive+1}: klik titik B`
+    : `${siap} garis siap — ＋ garis baru untuk menambah, atau ✎ untuk gambar ulang`;
+}
+function grsRenderList(){
+  const box = $("#grsList"); box.innerHTML = "";
+  grsLines.forEach((l, i) => {
+    const row = document.createElement("div");
+    row.className = "grsrow" + (i === grsActive ? " act" : "");
+    row.innerHTML = `<span class="grsswatch" style="background:${grsColor(i)}"></span>
+      <input class="grsnama" placeholder="nama (mis. gerbang)" value="${l.nama||""}">
+      <input class="grsmaju" placeholder="arah maju" value="${l.maju||""}">
+      <input class="grsmundur" placeholder="arah mundur" value="${l.mundur||""}">
+      <button class="ghost grsredraw" title="gambar ulang garis ini">✎</button>
+      <button class="grsdel" title="hapus garis">✕</button>`;
+    row.querySelector(".grsnama").oninput = e => { l.nama = e.target.value; grsRedraw(); };
+    row.querySelector(".grsmaju").oninput = e => { l.maju = e.target.value; grsRedraw(); };
+    row.querySelector(".grsmundur").oninput = e => { l.mundur = e.target.value; grsRedraw(); };
+    row.querySelector(".grsredraw").onclick = () => { l.pts = []; grsActive = i; grsRenderList(); grsRedraw(); };
+    row.querySelector(".grsdel").onclick = () => {
+      grsLines.splice(i, 1);
+      if(grsActive >= grsLines.length) grsActive = grsLines.length - 1;
+      grsRenderList(); grsRedraw();
+    };
+    row.onclick = e => {
+      if(e.target.tagName === "INPUT" || e.target.tagName === "BUTTON") return;
+      grsActive = i; grsRenderList(); grsRedraw();
+    };
+    box.appendChild(row);
+  });
+}
+function grsSizeAndDraw(){
+  const c = $("#grsCanvas");
+  if(!grsImg) return;
+  const availW = $("#grsWrap").clientWidth || 800;
+  c.width = Math.round(availW);
+  c.height = Math.round(availW * (grsImg.naturalHeight/grsImg.naturalWidth || 9/16));
+  grsRedraw();
+}
+function grsLoadFrame(){
+  const cam = $("#grsCam").value;
+  if(!cam){ $("#grsHint").hidden = false; $("#grsHint").textContent = "tak ada kamera garasi-ringan"; return; }
+  $("#grsHint").hidden = false; $("#grsHint").textContent = "memuat frame…";
+  const img = new Image();
+  img.onload = () => { grsImg = img; $("#grsHint").hidden = true; grsSizeAndDraw(); };
+  img.onerror = () => { grsImg = null; $("#grsHint").hidden = false;
+    $("#grsHint").textContent = "gagal ambil frame (go2rtc mati / stream tak ada?)"; };
+  img.src = `/api/frame?camera=${encodeURIComponent(cam)}&t=${Date.now()}`;
+}
+function applyGarisConfig(k){
+  const gp = k && k.garis_periksa;
+  const arr = Array.isArray(gp) ? gp : (gp ? [gp] : []);
+  grsLines = arr.filter(g => Array.isArray(g.garis) && g.garis.length === 2).map(g => ({
+    pts: g.garis.map(p => [p[0], p[1]]),
+    nama: g.nama || "",
+    maju: (g.label && g.label.maju) || "",
+    mundur: (g.label && g.label.mundur) || "",
+  }));
+  grsActive = grsLines.length ? grsLines.length - 1 : -1;
+  grsRenderList();
+}
+async function openGaris(){
+  const cfg = await (await fetch("/api/cameras")).json();
+  grsCams = (cfg.kamera||[]).filter(k => k.peran==="garasi-ringan" && k.nama);
+  $("#grsCam").innerHTML = grsCams.length
+    ? grsCams.map(k => `<option value="${k.nama}">${k.nama}</option>`).join("")
+    : `<option value="">(tak ada kamera garasi-ringan)</option>`;
+  applyGarisConfig(grsCams[0]);
+  $("#grsStatus").textContent = "";
+  $("#garisModal").hidden = false;
+  setTimeout(() => { grsSizeAndDraw(); grsLoadFrame(); }, 0);
+}
+async function saveGaris(){
+  const st = $("#grsStatus"), cam = $("#grsCam").value;
+  if(!cam){ st.textContent = "tak ada kamera"; return; }
+  const lines = grsJson();
+  if(!lines.length){ st.textContent = "tarik minimal 1 garis (2 titik) dulu"; return; }
+  st.textContent = "menyimpan…";
+  try {
+    const cfg = await (await fetch("/api/cameras")).json();
+    const k = (cfg.kamera||[]).find(x => x.nama === cam);
+    if(!k){ st.textContent = "kamera tak ditemukan di config"; return; }
+    k.garis_periksa = lines;
+    const r = await (await fetch("/api/cameras", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(cfg)})).json();
+    st.textContent = r.ok ? `tersimpan ✓ ${lines.length} garis → cameras.json (berlaku live)` : "gagal: " + r.error;
+  } catch(e){ st.textContent = "error: " + e; }
+}
+$("#grsCanvas").addEventListener("click", ev => {
+  if(!grsImg || grsActive < 0) return;
+  const l = grsLines[grsActive];
+  if(!l || l.pts.length >= 2) return;                    // garis aktif sudah lengkap -> tekan ＋ garis baru
+  const r = ev.currentTarget.getBoundingClientRect();
+  const fx = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+  const fy = Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height));
+  l.pts.push([fx, fy]);
+  grsRedraw();
+});
+$("#grsAddLine").onclick = () => {
+  grsLines.push({ pts: [], nama: "", maju: "", mundur: "" });
+  grsActive = grsLines.length - 1;
+  grsRenderList(); grsRedraw();
+};
+$("#openGaris").onclick = openGaris;
+$("#garisClose").onclick = () => $("#garisModal").hidden = true;
+$("#garisModal").onclick = ev => { if(ev.target === $("#garisModal")) $("#garisModal").hidden = true; };
+$("#grsCam").onchange = () => { applyGarisConfig(grsCams.find(c => c.nama === $("#grsCam").value)); grsLoadFrame(); };
+$("#grsReload").onclick = grsLoadFrame;
+$("#grsCopy").onclick = () => {
+  const txt = JSON.stringify(grsJson(), null, 2);
+  if(navigator.clipboard){ navigator.clipboard.writeText(txt); $("#grsStatus").textContent = "JSON disalin"; }
+};
+$("#grsSave").onclick = saveGaris;
+window.addEventListener("resize", () => { if(!$("#garisModal").hidden) grsSizeAndDraw(); });
 
 loadMeta().then(fetchData);
 </script>
