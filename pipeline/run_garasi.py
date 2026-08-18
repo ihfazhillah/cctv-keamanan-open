@@ -271,6 +271,42 @@ class Tripwire:
             del self.last[tid]
 
 
+class FootTracker:
+    """Tracker titik-kaki RINGAN (nearest-neighbor + gate jarak) — pengganti BoT-SORT
+    khusus garasi. Bukti (pelari 03:10): BoT-SORT gagal beri ID stabil (tid None,
+    flicker) & conf jatuh <0.35 TEPAT saat menyeberang -> crossing luput. NN over
+    frame RAPAT + conf rendah + toleransi lubang (ttl) menangkapnya: satu objek cepat
+    = asosiasi trivial & andal, tanpa jeda-konfirmasi BoT-SORT. Murni-state, teruji.
+    Titik fraksi [0..1]."""
+
+    def __init__(self, max_dist=0.18, ttl=1.5):
+        self.max_dist = max_dist       # jarak maks asosiasi antar-frame (fraksi)
+        self.ttl = ttl                 # detik: track tak-terlihat > ttl -> dilupakan (jembatani lubang deteksi)
+        self.tracks = {}               # id -> (kaki, t)
+        self._next = 1
+
+    def update(self, feet, t):
+        """feet: list (fx,fy). Return list (id,(fx,fy)) — ID stabil via NN greedy."""
+        for i in [k for k, (_, tt) in list(self.tracks.items()) if t - tt > self.ttl]:
+            del self.tracks[i]
+        out, used = [], set()
+        for f in feet:                 # tiap deteksi -> track terdekat dalam gate
+            best, bd = None, self.max_dist
+            for i, (pf, _) in self.tracks.items():
+                if i in used:
+                    continue
+                d = ((f[0] - pf[0]) ** 2 + (f[1] - pf[1]) ** 2) ** 0.5
+                if d < bd:
+                    bd, best = d, i
+            if best is None:
+                best = self._next
+                self._next += 1
+            used.add(best)
+            self.tracks[best] = (f, t)
+            out.append((best, f))
+        return out
+
+
 def _garis_lines(gp):
     """Normalisasi garis_periksa -> list of dict {garis,label,nama}. Terima BENTUK:
     dict tunggal (legacy 1 garis) ATAU list (banyak garis). Buang entri tak valid."""
@@ -318,26 +354,27 @@ class Worker(threading.Thread):
             out.append((Tripwire(g["garis"][0], g["garis"][1]), labels, nama))
         return out
 
-    def _track_feet(self, frame, abaikan):
-        """model.track -> (ada_person: bool, feet: [(tid,(fx,fy))]). Titik-kaki =
-        BOTTOM_CENTER box dalam FRAKSI (pusat-x, tepi-bawah-y). Tolak box yg PUSATnya
-        di zona abaikan (konsisten ada_person). Dipanggil DI BAWAH mlock — state BoT-SORT
-        menempel pd model bersama; asumsi garasi = 1 kamera bertripwire (lihat main)."""
-        result = self.model.track(frame, persist=True, tracker="botsort_reid.yaml",
-                                  classes=[0], conf=self.args.conf, verbose=False)[0]
+    def _predict_feet(self, frame, abaikan):
+        """model.predict (BUKAN track) -> (ada_person: bool, feet: [(fx,fy)]). Titik-kaki
+        = BOTTOM_CENTER box FRAKSI. Deteksi di conf RENDAH `cross_conf` (tangkap pelari
+        jauh/buram yg jatuh <0.35 saat menyeberang); `ada` (presence) tetap butuh conf
+        >= args.conf. FootTracker (per-worker) yg beri ID — bukan BoT-SORT yg flicker
+        utk objek cepat. Tolak box yg PUSATnya di zona abaikan."""
+        result = self.model.predict(frame, classes=[0], conf=self.args.cross_conf,
+                                    verbose=False)[0]
         boxes = result.boxes
         ada, feet = False, []
         if boxes is None or boxes.xyxy is None or len(boxes) == 0:
             return ada, feet
         h, w = result.orig_shape
-        ids = boxes.id.tolist() if boxes.id is not None else [None] * len(boxes)
-        for (x1, y1, x2, y2), tid in zip(boxes.xyxy.tolist(), ids):
+        confs = boxes.conf.tolist()
+        for (x1, y1, x2, y2), cf in zip(boxes.xyxy.tolist(), confs):
             cx, cy = (x1 + x2) / 2 / w, (y1 + y2) / 2 / h
             if _dalam_rect(cx, cy, abaikan):
                 continue
-            ada = True
-            if tid is not None:
-                feet.append((int(tid), ((x1 + x2) / 2 / w, y2 / h)))   # titik-kaki fraksi
+            if cf >= self.args.conf:                 # presence butuh conf penuh (redam FP)
+                ada = True
+            feet.append(((x1 + x2) / 2 / w, y2 / h))  # crossing pakai conf rendah -> semua box
         return ada, feet
 
     def run(self):
@@ -358,6 +395,7 @@ class Worker(threading.Thread):
         i, last_hb = 0, 0.0
         n_gerak = n_yolo = 0                                # statistik utk tuning (heartbeat)
         last_frac = 0.0
+        ft = FootTracker()                                 # ID titik-kaki ringan (ganti BoT-SORT)
         print(f"[GARASI:{self.nama}] worker mulai stream={cam['stream']} "
               f"motion={'on' if gate else 'off'} abaikan={len(abaikan)} zona "
               f"tripwire={len(trips)} garis " + (",".join(n for _, _, n in trips) if trips else "off"), flush=True)
@@ -380,19 +418,20 @@ class Worker(threading.Thread):
                     print(f"[HIDUP] {self.nama} frame#{i} notif={'aktif' if notif else 'senyap'} "
                           f"gerak={n_gerak} yolo={n_yolo} frac_terakhir={last_frac:.4f}", flush=True)
                     last_hb = t
-                if i % self.args.every:
-                    continue                                # sampling frame ke-N (deteksi TETAP 24/7 spt taman)
+                ev = 1 if trips else self.args.every        # tripwire = frame RAPAT (10fps) utk pelari cepat;
+                if i % ev:                                   # tanpa garis = sampling jarang (hemat)
+                    continue                                # deteksi TETAP 24/7 spt taman
                 if gate is not None:                        # gerbang MURAH dulu: ada gerak?
                     gerak, last_frac = gate.ada_gerak(frame)
                     if not gerak:
                         deb.on_frame(False, t)              # scene diam -> tak ada orang (reset streak)
                         continue                            # YOLO DILEWATI (hemat + redam phantom statis)
                     n_gerak += 1
-                if trips:                                    # alur BoT-SORT: presence + tripwire berarah (banyak garis)
-                    with self.mlock:                        # serialize akses model bersama (state tracker di model)
-                        ada, feet = self._track_feet(frame, abaikan)
-                    for trip, labels, nama in trips:        # tiap GARIS diuji thd tiap kaki
-                        for tid, kaki in feet:
+                if trips:                                    # predict conf-rendah + FootTracker + tripwire berarah
+                    with self.mlock:                        # serialize akses model bersama
+                        ada, feet = self._predict_feet(frame, abaikan)
+                    for tid, kaki in ft.update(feet, t):    # ID stabil dari FootTracker (bukan BoT-SORT)
+                        for trip, labels, nama in trips:    # tiap GARIS diuji thd kaki ber-ID
                             arah = trip.update(tid, kaki, t)
                             if arah:
                                 label = labels[arah]
@@ -402,6 +441,7 @@ class Worker(threading.Thread):
                                     self.writer.tulis(ts=t, kind="garasi", zone=nama, notify=notif,
                                                       payload={"kind": "garasi", "camera": self.nama, "at": t,
                                                                "arah": label, "lintas": True, "garis": nama})
+                    for trip, _, _ in trips:
                         trip.prune(t)
                 else:                                        # kamera tanpa garis -> jalur predict murah lama
                     with self.mlock:
@@ -432,8 +472,10 @@ def main():
     ap = argparse.ArgumentParser(description="Detektor orang garasi (gated by jadwal)")
     ap.add_argument("--cameras-file", default="cameras.json")
     ap.add_argument("--model", default="yolo11s.pt")
-    ap.add_argument("--conf", type=float, default=0.35)
-    ap.add_argument("--every", type=int, default=5, help="cek tiap ke-N frame (fps rendah)")
+    ap.add_argument("--conf", type=float, default=0.35, help="ambang presence 'ada orang'")
+    ap.add_argument("--cross-conf", type=float, default=0.20,
+                    help="ambang deteksi utk tripwire (lebih rendah: tangkap pelari jauh/buram)")
+    ap.add_argument("--every", type=int, default=5, help="cek tiap ke-N frame (kamera TANPA garis; bergaris=1)")
     ap.add_argument("--need-frames", type=int, default=3)
     ap.add_argument("--cooldown", type=float, default=60)
     ap.add_argument("--no-motion", dest="motion", action="store_false",
@@ -459,19 +501,10 @@ def main():
 
     print(f"[GARASI] supervisor mulai model={args.model} dry_run={args.dry_run}", flush=True)
     workers = {}                                 # nama -> Worker
-    warned_trip = False
     try:
         while not stop["v"]:
             watcher.reload_if_changed()
             want = kamera_garasi(watcher.cfg)
-            if not warned_trip:                  # BoT-SORT state menempel pd model bersama
-                trips = [k["nama"] for k in watcher.cfg.get("kamera", [])
-                         if k.get("nama") in want and _garis_lines(k.get("garis_periksa"))]
-                if len(trips) > 1:
-                    print(f"[GARASI] PERINGATAN: {len(trips)} kamera bertripwire berbagi state "
-                          f"BoT-SORT satu model ({trips}) -> ID track bisa tercampur. "
-                          f"Untuk >1, jalankan proses run_garasi terpisah per kamera.", flush=True)
-                    warned_trip = True
             for nama in want:                    # start baru / restart yang mati (stream putus)
                 w = workers.get(nama)
                 if w is None or not w.is_alive():

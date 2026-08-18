@@ -83,3 +83,44 @@ def test_garis_lines_normalisasi():
     assert len(_garis_lines([satu, satu])) == 2         # list banyak garis
     assert _garis_lines(None) == []
     assert _garis_lines([{"garis": [[0, 0]]}]) == []    # garis tak lengkap -> dibuang
+
+
+def test_foottracker_id_konsisten_satu_objek():
+    from run_garasi import FootTracker
+    ft = FootTracker(max_dist=0.18, ttl=1.5)
+    ids = [ft.update([(0.73 - k*0.02, 0.44)], t=k*0.1)[0][0] for k in range(6)]
+    assert len(set(ids)) == 1                        # satu objek bergerak -> satu ID
+
+
+def test_foottracker_dua_objek_terpisah():
+    from run_garasi import FootTracker
+    ft = FootTracker()
+    a = ft.update([(0.2, 0.5), (0.8, 0.5)], t=0.0)
+    b = ft.update([(0.22, 0.5), (0.78, 0.5)], t=0.1)
+    assert {i for i, _ in a} == {i for i, _ in b}    # dua ID sama dipertahankan
+    assert len({i for i, _ in a}) == 2
+
+
+def test_foottracker_jembatani_lubang_deteksi():
+    from run_garasi import FootTracker
+    ft = FootTracker(max_dist=0.18, ttl=1.5)
+    id0 = ft.update([(0.6, 0.42)], t=1.5)[0][0]
+    # lubang deteksi 0.3s (frame conf<ambang) lalu muncul lagi dekat -> ID sama
+    id1 = ft.update([(0.57, 0.41)], t=1.9)[0][0]
+    assert id0 == id1
+
+
+def test_foottracker_lompat_jauh_id_baru():
+    from run_garasi import FootTracker
+    ft = FootTracker(max_dist=0.18)
+    id0 = ft.update([(0.2, 0.5)], t=0.0)[0][0]
+    id1 = ft.update([(0.9, 0.5)], t=0.1)[0][0]       # > max_dist -> ID baru
+    assert id0 != id1
+
+
+def test_foottracker_lupakan_setelah_ttl():
+    from run_garasi import FootTracker
+    ft = FootTracker(max_dist=0.18, ttl=1.0)
+    id0 = ft.update([(0.5, 0.5)], t=0.0)[0][0]
+    id1 = ft.update([(0.5, 0.5)], t=5.0)[0][0]       # > ttl -> track lama dilupakan -> ID baru
+    assert id0 != id1
