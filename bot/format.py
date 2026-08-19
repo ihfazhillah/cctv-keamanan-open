@@ -69,8 +69,31 @@ def _garasi(ev):
     return f"🚗 ORANG DI GARASI\n{jam(ev.get('at', 0))}"
 
 
+def _durasi(d):
+    d = int(d or 0)
+    return f"{d // 60} mnt" if d >= 60 else f"{d} dtk"
+
+
+def _scene(ev):
+    """Notif anti-spam okupansi-kontinu taman (SceneNotifier)."""
+    n = ev.get("count")
+    match ev.get("kind"):
+        case "scene_masuk":
+            return f"🟢 ADA ORANG DI TAMAN · {n} orang\n{jam(ev.get('at', 0))}"
+        case "scene_tambah":
+            return f"➕ ORANG BERTAMBAH DI TAMAN · {n} (dari {ev.get('prev')})\n{jam(ev.get('at', 0))}"
+        case "scene_digest":
+            return f"⏳ MASIH ADA ORANG · {n} orang · {_durasi(ev.get('dur'))}\n{jam(ev.get('at', 0))}"
+        case "scene_kosong":
+            return f"⚪ TAMAN KOSONG LAGI · tadi puncak {ev.get('peak')} · {_durasi(ev.get('dur'))}\n{jam(ev.get('at', 0))}"
+    return f"TAMAN\n{jam(ev.get('at', 0))}"
+
+
 def caption(payload):
-    match payload.get("kind"):
+    kind = payload.get("kind", "")
+    if kind.startswith("scene_"):
+        return _scene(payload)
+    match kind:
         case "loiter": return _loiter(payload)
         case "close": return _close(payload)
         case "episode": return _episode(payload)

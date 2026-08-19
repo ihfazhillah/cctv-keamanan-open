@@ -610,6 +610,83 @@ class SceneEpisode:
         return "lewat"
 
 
+class SceneNotifier:
+    """Gerbang notif anti-spam berbasis OKUPANSI KONTINU (bukan identitas/ReID).
+    Masalah: orang loiter berjam-jam -> episode/loiter fire berulang tiap gerakan
+    kecil = spam. Solusi: satu presence KONTINU = satu peristiwa. `count` = jumlah
+    orang SERENTAK di dalam (dihitung pemanggil dari tid_to_zone, exclude jalan-utama).
+
+    State machine (murni-logika & event-based, teruji test_scene_notifier):
+
+        KOSONG ──(count>0)──────────────────> TERISI     -> scene_masuk (arm)
+        TERISI ──(count > puncak, tahan bump_persist_s)   -> scene_tambah (proxy 'orang
+                                                             baru' tanpa ReID)
+        TERISI ──(tiap digest_s)────────────> scene_digest (ringkasan 'masih ada orang')
+        TERISI ──(count==0 selama ≥ grace_s)─> KOSONG     -> scene_kosong (re-arm)
+
+    Event: {"kind": "scene_masuk|scene_tambah|scene_digest|scene_kosong", "at", ...}.
+    """
+
+    def __init__(self, grace_s=6.0, digest_s=1800.0, bump_persist_s=3.0):
+        self.grace_s = grace_s              # kosong selama ini -> tutup presence (re-arm)
+        self.digest_s = digest_s            # interval ringkasan 'masih ada orang'
+        self.bump_persist_s = bump_persist_s  # kenaikan count harus bertahan -> redam track pecah
+        self._reset()
+
+    def _reset(self):
+        self.active = False
+        self.start_t = None
+        self.last_seen_t = None             # kapan terakhir count>0
+        self.peak = 0
+        self.last_digest_t = None
+        self._cand = 0                      # kandidat count-naik yg sedang 'diuji tahan'
+        self._cand_since = None
+
+    def update(self, count, t):
+        """count = jumlah orang serentak di dalam (int ≥0). -> list event notif."""
+        if not self.active:
+            if count > 0:
+                self.active = True
+                self.start_t = self.last_seen_t = self.last_digest_t = t
+                self.peak = count
+                self._cand, self._cand_since = 0, None
+                return [{"kind": "scene_masuk", "at": t, "count": count}]
+            return []
+
+        out = []
+        if count > 0:
+            self.last_seen_t = t
+            if count > self.peak:                       # kenaikan -> uji tahan bump_persist_s
+                if count != self._cand:
+                    self._cand, self._cand_since = count, t
+                elif t - self._cand_since >= self.bump_persist_s:
+                    out.append({"kind": "scene_tambah", "at": t, "count": count, "prev": self.peak})
+                    self.peak = count
+                    self._cand, self._cand_since = 0, None
+            else:
+                self._cand, self._cand_since = 0, None
+            if t - self.last_digest_t >= self.digest_s:
+                out.append({"kind": "scene_digest", "at": t, "dur": t - self.start_t,
+                            "count": count, "peak": self.peak})
+                self.last_digest_t = t
+        elif t - self.last_seen_t >= self.grace_s:      # kosong cukup lama -> tutup
+            out.append(self._kosong(t))
+            self._reset()
+        return out
+
+    def flush(self, t):
+        """Tutup presence terbuka saat shutdown."""
+        if not self.active:
+            return []
+        out = [self._kosong(t)]
+        self._reset()
+        return out
+
+    def _kosong(self, t):
+        return {"kind": "scene_kosong", "at": t, "start": self.start_t,
+                "dur": (self.last_seen_t or t) - self.start_t, "peak": self.peak}
+
+
 def _hhmm(s):
     h, m = s.split(":")
     return int(h) * 60 + int(m)

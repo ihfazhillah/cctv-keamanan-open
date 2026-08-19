@@ -35,7 +35,8 @@ import requests
 
 import live                        # modul (untuk mutasi live.ZONE_DEPTH via ConfigPoll)
 from live import (FrameBuffer, EpisodeTracker, consume, SENTINEL, RuleEngine,
-                  PendingNotifier, TransitAggregator, notif_aktif, SceneEpisode)
+                  PendingNotifier, TransitAggregator, notif_aktif, SceneEpisode,
+                  SceneNotifier)
 from encode import reencode_h264   # encoder auto (GPU->CPU) -> jalan juga di laptop tanpa GPU
 import db                          # penyimpanan bersama SQLite (kontrak dgn service bot)
 
@@ -49,6 +50,10 @@ TG_VIA_BOT = os.environ.get("TG_VIA_BOT") == "1"
 # andal, kebal kedip track) alih-alih transit (rapuh). Transit -> notify=0 (tak dobel);
 # episode masuk/keluar -> notify=1 (saring 'lewat'/jalan-utama). Default: transit seperti biasa.
 NOTIFY_FROM_EPISODE = os.environ.get("NOTIFY_FROM_EPISODE") == "1"
+# NOTIFY_FROM_SCENE=1 -> anti-spam loiter: notif dari OKUPANSI KONTINU (SceneNotifier),
+# BUKAN per-gerakan. Saat aktif: episode/loiter/close -> notify=0 (tetap direkam+viewer,
+# senyap); scene_masuk/tambah/digest/kosong -> notify=1. Satu presence = satu peristiwa.
+NOTIFY_FROM_SCENE = os.environ.get("NOTIFY_FROM_SCENE") == "1"
 # SKIP_PIPELINE_CLIP=1 -> inti TAK meng-encode klip/episode sendiri (klip diambil dari
 # segmen segrec). Hilangkan encode-spike (fps=0) + hentikan pertumbuhan out/live +
 # hemat GPU. Event tetap ditulis ke DB (tanpa path klip). Butuh segrec tepercaya.
@@ -509,7 +514,8 @@ class ClipRecorder:
         kabari); close/loiter tetap notify=1 (alert mandiri)."""
         if not self.writer:
             return
-        notify_clip = 0 if (NOTIFY_FROM_EPISODE and ev["kind"] in self.TRANSIT_KINDS) else 1
+        notify_clip = 0 if (NOTIFY_FROM_SCENE                          # scene mode: semua chatter senyap
+                            or (NOTIFY_FROM_EPISODE and ev["kind"] in self.TRANSIT_KINDS)) else 1
         self.writer.tulis(ts=self._event_time(ev), kind=ev["kind"], zone=ev.get("zone"),
                           species=ev.get("species"), clip=clip, notify=notify_clip, payload=ev)
 
@@ -677,7 +683,7 @@ class EpisodeRecorder:
         if self.db:
             gates = ev.get("gates", [])
             layak = ev.get("arah") in ("masuk", "keluar") and any(g != "jalan-utama" for g in gates)
-            notify = 1 if (NOTIFY_FROM_EPISODE and layak) else 0
+            notify = 1 if (NOTIFY_FROM_EPISODE and layak and not NOTIFY_FROM_SCENE) else 0
             self.db.tulis(ts=ev.get("start", 0), kind="episode", clip=clip,
                           notify=notify, payload=dict(ev))
         print(f"[EPISODE] {ev['arah']} {ev['gates']} -> {clip or '(tanpa klip)'}", flush=True)
@@ -686,9 +692,34 @@ class EpisodeRecorder:
         self.jobs.shutdown(wait=True)
 
 
+class SceneNotifyMirror:
+    """Sisi-I/O SceneNotifier: terima `count` (orang serentak di dalam) per frame ->
+    event scene_* ke DB (notify=1). Klip diambil BOT dari segmen (payload camera+at),
+    seperti garasi. Hanya dipakai saat NOTIFY_FROM_SCENE (anti-spam loiter)."""
+
+    def __init__(self, notifier, writer, camera="taman"):
+        self.n = notifier
+        self.db = writer
+        self.camera = camera
+
+    def _emit(self, evs):
+        for ev in evs:
+            print(f"[SCENE] {ev['kind']} count={ev.get('count')} peak={ev.get('peak')} "
+                  f"dur={ev.get('dur')}", flush=True)
+            if self.db:
+                self.db.tulis(ts=ev["at"], kind=ev["kind"], notify=1,
+                              payload={**ev, "camera": self.camera})
+
+    def observe(self, count, t):
+        self._emit(self.n.update(count, t))
+
+    def flush(self, t):
+        self._emit(self.n.flush(t))
+
+
 # ══ Orkestrasi: rangkai stage jadi satu loop pipeline ══════════════════════════
 def run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit, q,
-                 debug=None, episodes=None, config=None, sightings=None):
+                 debug=None, episodes=None, config=None, sightings=None, scene=None):
     frame_no = 0
     last_hb_t = time.time()
     t = last_hb_t
@@ -721,6 +752,10 @@ def run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit
             if episodes:
                 episodes.observe(t, frame, occupied)   # SATU video per episode (zone-driven)
 
+            if scene:                                   # gerbang notif anti-spam okupansi-kontinu
+                count = sum(1 for z in tid_to_zone.values() if z and z not in live.LUAR)
+                scene.observe(count, t)                 # count = orang serentak DI DALAM (bukan jalan-utama)
+
             if debug:
                 debug.log(t, tid_to_zone, cat_tid_to_zone)
 
@@ -748,6 +783,8 @@ def run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit
             finish_reason = "stream_putus"                   # generator habis = stream putus
 
     finally:
+        if scene:
+            scene.flush(t)                       # tutup presence terbuka -> scene_kosong terakhir
         if episodes:
             episodes.flush(t)                    # tutup episode terbuka -> klip terakhir keluar
         # flush: tutup episode/presence terbuka -> klip terakhir tak tersangkut selamanya
@@ -804,6 +841,10 @@ def parse_args():
                         help="detik pra-rekam sebelum orang pertama muncul.")
     parser.add_argument("--no-episode", action="store_true",
                         help="matikan perekam episode scene-level.")
+    parser.add_argument("--camera", default="taman", type=str,
+                        help="nama kamera (tag payload; bot potong klip dari out/segments/<camera>).")
+    parser.add_argument("--scene-digest", default=1800.0, type=float,
+                        help="interval ringkasan 'masih ada orang' saat NOTIFY_FROM_SCENE (detik).")
     return parser.parse_args()
 
 
@@ -840,6 +881,14 @@ def main():
             SceneEpisode(grace_s=args.episode_grace, max_s=args.episode_max),
             out_dir=args.out_dir, pre_s=args.episode_pre, writer=writer)
 
+        scene = None
+        if NOTIFY_FROM_SCENE:                         # gerbang notif anti-spam (opt-in)
+            scene = SceneNotifyMirror(
+                SceneNotifier(grace_s=args.episode_grace, digest_s=args.scene_digest),
+                writer, camera=args.camera)
+            print(f"[MODE] NOTIFY_FROM_SCENE=1 -> notif dari okupansi-kontinu "
+                  f"(digest tiap {args.scene_digest:.0f}s); episode/loiter/close senyap.", flush=True)
+
         debug = DebugLog(args.debug_toggle, args.debug_dir)
         config = ConfigPoll(args.db, detector, engine, cat_engine)   # config live dari DB (bot)
         # RECORD_SIGHTINGS=1 (default) -> catat SETIAP track masuk zona bernama sbg 'lewat'
@@ -847,7 +896,7 @@ def main():
         # tapi bot 'send_lewat' default off -> tercatat tanpa spam Telegram.
         sightings = None if os.environ.get("RECORD_SIGHTINGS", "1") != "1" else SightingRecorder(writer)
         run_pipeline(source, detector, occupancy, engine, cat_engine, clips, transit, q,
-                     debug, episodes, config, sightings)
+                     debug, episodes, config, sightings, scene)
         consumer.join()
         recorder.close()          # tuntaskan upload yang masih di antrean
         if episodes:

@@ -46,7 +46,7 @@ HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 # 'segment' (potong dari segmen segrec -> beraudio & mulus; fallback ke pipeline).
 DEFAULTS = {"notif_default": "aktif", "armed": "on",
             "send_close": "on", "send_loiter": "on", "send_transit": "on", "send_kucing": "on",
-            "send_garasi": "on", "send_lewat": "off", "clip_source": "pipeline"}
+            "send_garasi": "on", "send_lewat": "off", "send_scene": "on", "clip_source": "pipeline"}
 CAMERAS_FILE = os.environ.get("CAMERAS_FILE", "cameras.json")   # sumber bersama (viewer + run_garasi)
 # kedalaman default (mirror ZONE_DEPTH kode; utk editor zone-depth)
 BUILTIN_DEPTH = {"jalan-masuk": 1, "tangga": 1, "taman": 2, "dekat-kolam": 2, "teras": 2, "pintu": 3}
@@ -120,8 +120,9 @@ def keputusan_kirim(con, ev, default, rules):
     p = ev["payload"]
     if p.get("species") == "kucing" and sget(con, "send_kucing") != "on":
         return "skipped_filter"
-    kat = {"close": "send_close", "loiter": "send_loiter", "lewat": "send_lewat",
-           "garasi": "send_garasi"}.get(ev["kind"], "send_transit")
+    kat = ("send_scene" if ev["kind"].startswith("scene_") else
+           {"close": "send_close", "loiter": "send_loiter", "lewat": "send_lewat",
+            "garasi": "send_garasi"}.get(ev["kind"], "send_transit"))
     if sget(con, kat) != "on":
         return "skipped_filter"
     if not arming.notif_aktif(default, rules, arming.tags_of(p), ev["ts"]):
@@ -142,12 +143,16 @@ def _seg_dir_kamera(cam):
     return os.path.join(SEG_DIR, cam)
 
 
-def _garasi_belum_siap(ev):
-    """Klip garasi dipotong dari arsipnya sendiri (out/segments/<cam>) -> butuh post-roll
-    sudah terekam. True bila event masih terlalu baru -> TUNDA kirim (jangan log skip)
-    sampai segmen post-roll ada. Berbasis waktu (bukan cek berkas) -> tak stall selamanya
-    kalau segrec mati (nanti jatuh ke notif teks)."""
-    if ev["kind"] != "garasi":
+# kind yg klipnya DIPOTONG dari segmen kamera sendiri (out/segments/<cam>), spt garasi.
+# scene_digest = ringkasan -> teks saja (tak masuk sini).
+SEGVID_KINDS = {"garasi", "scene_masuk", "scene_kosong", "scene_tambah"}
+
+
+def _klip_belum_siap(ev):
+    """Klip dipotong dari arsip kamera (out/segments/<cam>) -> butuh post-roll terekam.
+    True bila event masih terlalu baru -> TUNDA kirim (jangan log skip) sampai segmen
+    post-roll ada. Berbasis waktu -> tak stall selamanya kalau segrec mati (jatuh teks)."""
+    if ev["kind"] not in SEGVID_KINDS:
         return False
     at = ev["payload"].get("at", ev["ts"])
     return time.time() < at + GARASI_POST + SEG_TIME + 1
@@ -157,14 +162,14 @@ def kirim_media(con, ev):
     p = ev["payload"]
     cap = fmt.caption(p)
     path = None
-    if ev["kind"] == "garasi":                             # garasi PUNYA arsip sendiri (rekam:true)
+    if ev["kind"] in SEGVID_KINDS:                         # potong klip dari arsip kamera sendiri
         cam = os.path.basename(p.get("camera") or "")      # basename = anti-traversal
         if cam:
             t0, t1 = segcut.window_for(p, pre=GARASI_PRE, post=GARASI_POST)
             try:                                            # potong dari out/segments/<cam> (A/V, mulus)
                 path = segcut.cut(_seg_dir_kamera(cam), t0, t1, SEGCLIP_TMP, SEG_TIME)
             except Exception as e:
-                print(f"[SEGCUT] garasi gagal potong ({e!r}) -> notif teks", flush=True)
+                print(f"[SEGCUT] {ev['kind']} gagal potong ({e!r}) -> notif teks", flush=True)
     elif sget(con, "clip_source") == "segment":            # taman: potong dari segmen (A/V, mulus)
         t0, t1 = segcut.window_for(p)
         try:
@@ -193,7 +198,7 @@ def putaran_kirim():
             rules = db.list_arming_rules(con, only_enabled=True)
             for ev in db.unsent_events(con, limit=20):
                 status = keputusan_kirim(con, ev, default, rules)
-                if status == "sent" and _garasi_belum_siap(ev):
+                if status == "sent" and _klip_belum_siap(ev):
                     continue                     # tunda (post-roll belum lengkap) -> JANGAN log, coba lagi
                 if status != "sent":
                     db.log_send(con, ev["id"], status)
@@ -247,7 +252,8 @@ def layar_filter(con):
     kb = types.InlineKeyboardMarkup()
     for key, label in [("send_close", "👤 Singgah (close)"), ("send_loiter", "⏳ Berlama (loiter)"),
                        ("send_transit", "🚪 Masuk/Keluar"), ("send_lewat", "👣 Lewat (sekejap)"),
-                       ("send_kucing", "🐈 Kucing"), ("send_garasi", "🚗 Garasi")]:
+                       ("send_kucing", "🐈 Kucing"), ("send_garasi", "🚗 Garasi"),
+                       ("send_scene", "🌳 Taman (okupansi)")]:
         on = sget(con, key) == "on"
         kb.row(_tombol(("✅ " if on else "⬜ ") + label, f"flt:{key}"))
     kb.row(_tombol("⬅️ Menu", "nav:menu"))

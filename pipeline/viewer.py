@@ -57,7 +57,8 @@ CLIP_KINDS = {"close", "loiter"}
 # TAK ikut: 'episode' (mode Episode terpisah, di-derive) & 'keluar'/'masuk' lowercase
 # (transit klip internal).
 LOG_KINDS = ("close", "loiter", "lewat", "KELUAR rumah", "KELUAR property",
-             "MASUK rumah", "MASUK property", "garasi")
+             "MASUK rumah", "MASUK property", "garasi",
+             "scene_masuk", "scene_tambah", "scene_digest", "scene_kosong")
 
 
 # ══ Lapisan data ═══════════════════════════════════════════════════════════════
