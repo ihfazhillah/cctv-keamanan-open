@@ -29,8 +29,8 @@ import cv2
 import numpy as np
 
 # KELAS RULE ASLI (tak menduplikasi logika) — inilah yang di-'replay'
-from run_garasi import Tripwire, FootTracker, _garis_lines
-from live import SceneNotifier, LUAR
+from rules import (Tripwire, FootTracker, _garis_lines, LUAR,  # noqa: F401
+                   replay_tripwire, replay_scene)
 
 TRACE_DIR = "out/traces"
 # warna BGR (cv2): model=amber, rule=teal, kaki=putih, event=merah
@@ -122,43 +122,7 @@ def trace(clip, model="yolo11s.pt", conf=0.20, classes=(0,), tracker=None,
     return out
 
 
-# ══ RULE: observasi -> event (pakai kelas asli) ═════════════════════════════════
-def replay_tripwire(tr, lines, use_foottracker=True):
-    """Trace -> penyeberangan garis. lines = format garis_periksa (dict/list
-    {nama,garis,label}). tid dari FootTracker (default; andal utk objek cepat) atau
-    dari trace bila sudah ada (tracker=botsort saat trace)."""
-    tws = []
-    for i, g in enumerate(_garis_lines(lines)):
-        tws.append((Tripwire(g["garis"][0], g["garis"][1]),
-                    g.get("nama") or f"garis{i + 1}", g.get("label") or {}))
-    ft = FootTracker() if use_foottracker else None
-    out = []
-    for f in tr:
-        if ft is not None:
-            pairs = ft.update([tuple(d["kaki"]) for d in f["dets"]], f["t"])
-        else:
-            pairs = [(d["tid"], tuple(d["kaki"])) for d in f["dets"] if d["tid"] is not None]
-        for tid, kaki in pairs:
-            for tw, nama, lab in tws:
-                a = tw.update(tid, kaki, f["t"])
-                if a:
-                    out.append({"kind": "crossing", "garis": nama, "arah": lab.get(a, a),
-                                "at": f["t"], "tid": tid})
-        for tw, _, _ in tws:
-            tw.prune(f["t"])
-    return out
-
-
-def replay_scene(tr, notifier=None, **kw):
-    """Trace (butuh count -> trace pakai zone_file) -> event SceneNotifier. Beri
-    `notifier=SceneNotifier(...)` atau kwargs (grace_s=, min_presence_s=, digest_s=)."""
-    sn = notifier or SceneNotifier(**kw)
-    out = []
-    for f in tr:
-        out += sn.update(f["count"], f["t"])
-    if tr:
-        out += sn.flush(tr[-1]["t"] + 1e-3)
-    return out
+# ══ RULE: replay_* -> rules.py (di-import di atas) ═════════════════════════════════
 
 
 # ══ VISUAL: numpang penonton umum (bukan app) ═══════════════════════════════════
