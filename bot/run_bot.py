@@ -144,8 +144,8 @@ def _seg_dir_kamera(cam):
 
 
 # kind yg klipnya DIPOTONG dari segmen kamera sendiri (out/segments/<cam>), spt garasi.
-# scene_digest = ringkasan -> teks saja (tak masuk sini).
-SEGVID_KINDS = {"garasi", "scene_masuk", "scene_kosong", "scene_tambah"}
+# scene_kosong (taman kosong 90s lalu) & scene_digest (ringkasan) -> TEKS (klip tak berguna).
+SEGVID_KINDS = {"garasi", "scene_masuk", "scene_tambah"}
 
 
 def _klip_belum_siap(ev):

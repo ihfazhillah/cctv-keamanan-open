@@ -845,6 +845,11 @@ def parse_args():
                         help="nama kamera (tag payload; bot potong klip dari out/segments/<camera>).")
     parser.add_argument("--scene-digest", default=1800.0, type=float,
                         help="interval ringkasan 'masih ada orang' saat NOTIFY_FROM_SCENE (detik).")
+    parser.add_argument("--scene-grace", default=90.0, type=float,
+                        help="taman kosong sekian detik -> tutup presence (re-arm). Panjang = gabung "
+                             "kedipan jadi satu presence (anti masuk/kosong spam).")
+    parser.add_argument("--scene-min-presence", default=5.0, type=float,
+                        help="okupansi harus bertahan segini SEBELUM scene_masuk (buang pelewat/kedip).")
     return parser.parse_args()
 
 
@@ -884,10 +889,12 @@ def main():
         scene = None
         if NOTIFY_FROM_SCENE:                         # gerbang notif anti-spam (opt-in)
             scene = SceneNotifyMirror(
-                SceneNotifier(grace_s=args.episode_grace, digest_s=args.scene_digest),
+                SceneNotifier(grace_s=args.scene_grace, digest_s=args.scene_digest,
+                              min_presence_s=args.scene_min_presence),
                 writer, camera=args.camera)
-            print(f"[MODE] NOTIFY_FROM_SCENE=1 -> notif dari okupansi-kontinu "
-                  f"(digest tiap {args.scene_digest:.0f}s); episode/loiter/close senyap.", flush=True)
+            print(f"[MODE] NOTIFY_FROM_SCENE=1 -> notif okupansi-kontinu "
+                  f"(grace {args.scene_grace:.0f}s, min-presence {args.scene_min_presence:.0f}s, "
+                  f"digest {args.scene_digest:.0f}s); episode/loiter/close senyap.", flush=True)
 
         debug = DebugLog(args.debug_toggle, args.debug_dir)
         config = ConfigPoll(args.db, detector, engine, cat_engine)   # config live dari DB (bot)

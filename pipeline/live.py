@@ -627,15 +627,18 @@ class SceneNotifier:
     Event: {"kind": "scene_masuk|scene_tambah|scene_digest|scene_kosong", "at", ...}.
     """
 
-    def __init__(self, grace_s=6.0, digest_s=1800.0, bump_persist_s=3.0):
-        self.grace_s = grace_s              # kosong selama ini -> tutup presence (re-arm)
+    def __init__(self, grace_s=90.0, digest_s=1800.0, bump_persist_s=3.0, min_presence_s=5.0):
+        self.grace_s = grace_s              # kosong selama ini -> tutup presence (re-arm). PANJANG:
+                                            # gabung kedipan okupansi jadi SATU presence (anti masuk/kosong spam)
         self.digest_s = digest_s            # interval ringkasan 'masih ada orang'
         self.bump_persist_s = bump_persist_s  # kenaikan count harus bertahan -> redam track pecah
+        self.min_presence_s = min_presence_s  # okupansi harus bertahan segini SEBELUM 'scene_masuk' (buang lewat/kedip)
         self._reset()
 
     def _reset(self):
-        self.active = False
-        self.start_t = None
+        self.active = False                 # ada okupansi (mungkin belum diumumkan)
+        self.announced = False              # 'scene_masuk' sudah dikirim? (lewat debounce min_presence)
+        self.start_t = None                 # onset okupansi (utk dur & debounce)
         self.last_seen_t = None             # kapan terakhir count>0
         self.peak = 0
         self.last_digest_t = None
@@ -645,18 +648,25 @@ class SceneNotifier:
     def update(self, count, t):
         """count = jumlah orang serentak di dalam (int ≥0). -> list event notif."""
         if not self.active:
-            if count > 0:
+            if count > 0:                   # okupansi MULAI -> tunggu min_presence dulu (belum umumkan)
                 self.active = True
-                self.start_t = self.last_seen_t = self.last_digest_t = t
+                self.announced = False
+                self.start_t = self.last_seen_t = t
                 self.peak = count
                 self._cand, self._cand_since = 0, None
-                return [{"kind": "scene_masuk", "at": t, "count": count}]
             return []
 
         out = []
         if count > 0:
             self.last_seen_t = t
-            if count > self.peak:                       # kenaikan -> uji tahan bump_persist_s
+            if not self.announced:
+                if t - self.start_t >= self.min_presence_s:   # bertahan cukup -> UMUMKAN sekali
+                    self.announced = True
+                    self.last_digest_t = t
+                    self.peak = count
+                    out.append({"kind": "scene_masuk", "at": t, "count": count})
+                return out                                    # masih debounce / baru umum -> stop di sini
+            if count > self.peak:                             # kenaikan -> uji tahan bump_persist_s
                 if count != self._cand:
                     self._cand, self._cand_since = count, t
                 elif t - self._cand_since >= self.bump_persist_s:
@@ -669,16 +679,16 @@ class SceneNotifier:
                 out.append({"kind": "scene_digest", "at": t, "dur": t - self.start_t,
                             "count": count, "peak": self.peak})
                 self.last_digest_t = t
-        elif t - self.last_seen_t >= self.grace_s:      # kosong cukup lama -> tutup
-            out.append(self._kosong(t))
+        elif t - self.last_seen_t >= self.grace_s:            # kosong cukup lama -> tutup
+            if self.announced:                                # kalau tak pernah diumumkan (lewat sekejap) -> senyap
+                out.append(self._kosong(t))
             self._reset()
         return out
 
     def flush(self, t):
-        """Tutup presence terbuka saat shutdown."""
-        if not self.active:
-            return []
-        out = [self._kosong(t)]
+        """Tutup presence terbuka saat shutdown (hanya bila sudah diumumkan)."""
+        announced = self.active and self.announced
+        out = [self._kosong(t)] if announced else []
         self._reset()
         return out
 
