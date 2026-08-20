@@ -52,7 +52,9 @@ def build_taman_cmd(cam):
 
 
 def build_garasi_cmd(cameras_file):
-    return [PY, os.path.join(PIPE, "run_garasi.py"), "--cameras-file", cameras_file]
+    # --no-motion: gate DIBUKA -> YOLO tiap frame (tangkap orang DIAM di masjid/pintu yg
+    # motion-gate buang; lihat kasus 22:47/04:00). Trade-off: lebih boros GPU + rawan phantom statis.
+    return [PY, os.path.join(PIPE, "run_garasi.py"), "--cameras-file", cameras_file, "--no-motion"]
 
 
 def build_segrec_cmd():
