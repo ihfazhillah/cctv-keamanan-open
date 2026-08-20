@@ -243,7 +243,7 @@ def layar_menu(con):
            _tombol(("✅ " if default == "senyap" else "") + "🔕 Senyap", "def:senyap"))
     kb.row(_tombol("🔧 Filter jenis", "nav:filter"), _tombol("⚙️ Deteksi", "nav:deteksi"))
     kb.row(_tombol("🗓️ Jadwal", "nav:jadwal"), _tombol("📊 Ringkasan", "nav:ringkasan"))
-    kb.row(_tombol("📷 Garasi", "nav:garasi"))
+    kb.row(_tombol("📷 Garasi", "nav:garasi"), _tombol("📜 History", "nav:history"))
     return txt, kb
 
 
@@ -365,12 +365,129 @@ def layar_ringkasan(con, key="24j"):
     return "\n".join(baris), kb
 
 
+# ══ HISTORY (telegram): daftar event penting · filter(=search, no-LLM) · klip on-tap ══
+HIST_PER = 6                                        # event per halaman
+HIST_KINDS = ("garasi", "episode", "loiter", "close")  # kind mentah diambil (sisanya redundan/noise)
+# taksonomi manusiawi (disederhanakan): (id, chip-emoji utk tombol, label lengkap utk daftar)
+KATEGORI = [("garlintas", "🚶", "🚶 Lintas garasi"), ("garada", "👤", "👤 Orang garasi"),
+            ("masukrmh", "🟢", "🟢 Masuk rumah"), ("keluarrmh", "🔴", "🔴 Keluar rumah"),
+            ("loiter", "⏳", "⏳ Loiter"), ("singgah", "👣", "👣 Singgah")]
+KAT_FULL = {k: full for k, _, full in KATEGORI}
+_hist = {}                                          # chat_id -> {"pg", "j":set, "c":set, "a":set}
+
+
+def _kategori(kind, p):
+    """kind mentah + payload -> kategori manusiawi (atau None = disaring)."""
+    if kind == "garasi":
+        return "garlintas" if p.get("lintas") else "garada"
+    if kind == "episode":
+        return {"masuk": "masukrmh", "keluar": "keluarrmh"}.get(p.get("arah"))  # 'lewat' -> None
+    if kind == "loiter":
+        return "loiter"
+    if kind == "close":
+        return "singgah"
+    return None
+
+
+def _hist_events(con):
+    """Event 'penting' terbaru-dulu, sudah berkategori: {id, ts, kat, cam, arah, zona}."""
+    q = ("SELECT id, ts, kind, zone, payload FROM events WHERE kind IN (%s) "
+         "ORDER BY id DESC LIMIT 800" % ",".join("?" * len(HIST_KINDS)))
+    out = []
+    for r in con.execute(q, HIST_KINDS):
+        p = json.loads(r["payload"] or "{}")
+        kat = _kategori(r["kind"], p)
+        if not kat:
+            continue
+        out.append({"id": r["id"], "ts": r["ts"], "kat": kat,
+                    "cam": p.get("camera") or "taman",
+                    "arah": p.get("arah"), "zona": p.get("garis") or r["zone"]})
+    return out
+
+
+def _hist_state(chat):
+    return _hist.setdefault(chat, {"pg": 0, "j": set(), "c": set(), "a": set()})
+
+
+def layar_history(con, chat):
+    st = _hist_state(chat)
+    ev = _hist_events(con)
+    if st["j"]:
+        ev = [e for e in ev if e["kat"] in st["j"]]      # filter jenis (= search)
+    if st["c"]:
+        ev = [e for e in ev if e["cam"] in st["c"]]      # filter kamera
+    if st["a"]:
+        ev = [e for e in ev if e["arah"] in st["a"]]     # filter arah
+    npage = max(1, (len(ev) + HIST_PER - 1) // HIST_PER)
+    st["pg"] = max(0, min(st["pg"], npage - 1))
+    page = ev[st["pg"] * HIST_PER:(st["pg"] + 1) * HIST_PER]
+
+    baris = [f"📜 History · {len(ev)} event · terbaru dulu"]
+    aktif = []
+    if st["j"]:
+        aktif.append("jenis:" + ",".join(KAT_FULL[j].split(" ", 1)[1] for j in st["j"]))
+    if st["c"]:
+        aktif.append("kamera:" + ",".join(sorted(st["c"])))
+    if st["a"]:
+        aktif.append("arah:" + ",".join(sorted(st["a"])))
+    if aktif:
+        baris.append("🔎 " + " · ".join(aktif))
+    baris.append("")
+    for i, e in enumerate(page, 1):
+        jam = time.strftime("%H:%M:%S %d/%m", time.localtime(e["ts"]))
+        extra = " · ".join(x for x in (e["arah"], e["zona"]) if x)
+        baris.append(f"{i}. {jam} · {KAT_FULL[e['kat']]}" + (f" · {extra}" if extra else ""))
+    if not page:
+        baris.append("(tak ada yang cocok — longgarkan filter)")
+
+    kb = types.InlineKeyboardMarkup()
+    if page:
+        kb.row(*[_tombol(f"🎬{i}", f"hist:clip:{e['id']}") for i, e in enumerate(page, 1)])
+    kb.row(_tombol("◀️", "hist:pg:-"), _tombol(f"{st['pg'] + 1}/{npage}", "hist:noop"),
+           _tombol("▶️", "hist:pg:+"))
+    kb.row(*[_tombol(("✅" if k in st["j"] else "") + chip, f"hist:j:{k}") for k, chip, _ in KATEGORI])
+    kb.row(*[_tombol(("✅" if c in st["c"] else "") + c, f"hist:c:{c}") for c in ("garasi", "taman")])
+    kb.row(*[_tombol(("✅" if a in st["a"] else "") + a, f"hist:a:{a}")
+             for a in ("masuk", "keluar", "naik", "turun")])
+    kb.row(_tombol("♻️ Reset", "hist:reset"), _tombol("⬅️ Menu", "nav:menu"))
+    return "\n".join(baris), kb
+
+
+def _seg_potong_kirim(cam, at, cap):
+    """Potong klip 6s+10s dari arsip kamera di sekitar `at`, kirim video (atau teks bila tak ada)."""
+    try:
+        path = segcut.cut(_seg_dir_kamera(cam), at - GARASI_PRE, at + GARASI_POST, SEGCLIP_TMP, SEG_TIME)
+    except Exception as e:
+        path = None
+        print(f"[KLIP] gagal potong ({e!r})", flush=True)
+    if path and os.path.exists(path):
+        with open(path, "rb") as f:
+            bot.send_video(CHAT_ID, f, caption=cap, timeout=180)
+    else:
+        bot.send_message(CHAT_ID, cap + "\n⚠️ klip tak ada di arsip (di luar retensi?)")
+
+
+def _kirim_klip_event(con, eid):
+    r = con.execute("SELECT ts, payload FROM events WHERE id=?", (eid,)).fetchone()
+    if not r:
+        bot.send_message(CHAT_ID, "Event tak ditemukan."); return
+    p = json.loads(r["payload"] or "{}")
+    cam = os.path.basename(p.get("camera") or "taman")
+    at = p.get("at") or p.get("start") or r["ts"]
+    _seg_potong_kirim(cam, at, fmt.caption(p))
+
+
 LAYAR = {"menu": layar_menu, "filter": layar_filter, "deteksi": layar_deteksi,
          "zdepth": layar_zdepth, "jadwal": layar_jadwal, "garasi": layar_garasi}
 
 
 def tampil(con, chat_id, message_id, nama, **kw):
-    txt, kb = (layar_ringkasan(con, **kw) if nama == "ringkasan" else LAYAR[nama](con))
+    if nama == "ringkasan":
+        txt, kb = layar_ringkasan(con, **kw)
+    elif nama == "history":
+        txt, kb = layar_history(con, chat_id)
+    else:
+        txt, kb = LAYAR[nama](con)
     try:
         bot.edit_message_text(txt, chat_id, message_id, reply_markup=kb)
     except Exception:
@@ -398,6 +515,43 @@ def cmd_ringkasan(message):
     txt, kb = layar_ringkasan(con, "24j")
     bot.send_message(message.chat.id, txt, reply_markup=kb)
     con.close()
+
+
+@bot.message_handler(commands=["history"])
+def cmd_history(message):
+    if not milik_owner(message.chat.id):
+        return
+    con = db.connect(DB_PATH)
+    db.init_db(con)
+    _hist[message.chat.id] = {"pg": 0, "j": set(), "c": set(), "a": set()}   # reset tiap buka
+    txt, kb = layar_history(con, message.chat.id)
+    bot.send_message(message.chat.id, txt, reply_markup=kb)
+    con.close()
+
+
+@bot.message_handler(commands=["klip"])
+def cmd_klip(message):
+    """/klip <kamera> [YYYY-MM-DD] <HH:MM>  → potong klip arsip & kirim (default hari ini)."""
+    if not milik_owner(message.chat.id):
+        return
+    parts = (message.text or "").split()[1:]
+    if len(parts) < 2:
+        bot.send_message(message.chat.id,
+                         "Format: /klip <kamera> [YYYY-MM-DD] <HH:MM>\ncontoh: /klip garasi 22:53")
+        return
+    cam = os.path.basename(parts[0])
+    try:
+        if len(parts) >= 3:
+            at = time.mktime(time.strptime(parts[1] + " " + parts[2], "%Y-%m-%d %H:%M"))
+        else:
+            lt = time.localtime()
+            hh, mm = parts[1].split(":")
+            at = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, int(hh), int(mm), 0, 0, 0, -1))
+    except Exception:
+        bot.send_message(message.chat.id, "Jam/tanggal tak valid. contoh: /klip garasi 22:53")
+        return
+    bot.send_message(message.chat.id, f"⏳ memotong {cam} @ {parts[-1]}…")
+    _seg_potong_kirim(cam, at, f"🎬 Klip {cam} · {time.strftime('%Y-%m-%d %H:%M', time.localtime(at))}")
 
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -473,6 +627,24 @@ def on_callback(c):
                 txt, kb = layar_jadwal(con)
                 bot.edit_message_text("✅ Ditambah.\n\n" + txt, chat, mid, reply_markup=kb)
                 bot.answer_callback_query(c.id, "Tersimpan")
+        elif data == "hist:noop":
+            bot.answer_callback_query(c.id)
+        elif data.startswith("hist:pg:"):
+            st = _hist_state(chat)
+            st["pg"] += 1 if data.endswith("+") else -1
+            tampil(con, chat, mid, "history"); bot.answer_callback_query(c.id)
+        elif data.startswith(("hist:j:", "hist:c:", "hist:a:")):   # toggle filter (bukan hist:clip:)
+            _, dim, val = data.split(":", 2)                 # hist:<dim>:<val>
+            s = _hist_state(chat)[dim]
+            (s.discard if val in s else s.add)(val)
+            _hist_state(chat)["pg"] = 0
+            tampil(con, chat, mid, "history"); bot.answer_callback_query(c.id)
+        elif data == "hist:reset":
+            _hist[chat] = {"pg": 0, "j": set(), "c": set(), "a": set()}
+            tampil(con, chat, mid, "history"); bot.answer_callback_query(c.id, "Filter direset")
+        elif data.startswith("hist:clip:"):
+            bot.answer_callback_query(c.id, "⏳ memotong klip…")
+            _kirim_klip_event(con, int(data.split(":")[2]))
     finally:
         con.close()
 
