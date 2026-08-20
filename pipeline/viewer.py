@@ -1074,6 +1074,7 @@ INDEX_HTML = r"""<!doctype html>
   .zone { color:var(--fg); }
   .cat { color:var(--ev-cat); font-weight:600; }
   .med { color:var(--faint); }
+  .rowthumb { width:72px; height:40px; object-fit:cover; border-radius:5px; display:block; background:var(--screen); border:1px solid var(--line); }
   .dur { color:var(--dim); }
 
   .right { display:flex; flex-direction:column; min-height:0; padding:16px; gap:14px; overflow:auto; }
@@ -1300,7 +1301,12 @@ let ALL = [], selId = null, activeKinds = new Set(), queue = [], qOn = -1, META 
 const kindClass = k => k==="close" ? "k-dwell" : k==="loiter" ? "k-loiter"
   : k==="garasi" ? "k-garasi"
   : k.startsWith("MASUK") ? "k-enter" : k.startsWith("KELUAR") ? "k-exit" : "k-plain";
-const kindIcon = m => !m ? "" : (m.type==="video" ? "🎬" : "🖼");
+const kindIcon = m => {   // thumbnail preview per baris (video -> /thumb poster; snapshot -> gambarnya)
+  if(!m) return "";
+  const emoji = m.type==="video" ? "🎬" : "🖼";
+  const src = m.type==="video" ? m.url.replace('/media/','/thumb/') : m.url;
+  return `<img class="rowthumb" loading="lazy" src="${src}" alt="" title="klik baris untuk putar" onerror="this.outerHTML='${emoji}'">`;
+};
 const family = k => k==="close" ? "close" : k==="loiter" ? "loiter" : k.split(" ")[0];
 const dirClass = d => d==="keluar" ? "k-exit" : "k-enter";
 
