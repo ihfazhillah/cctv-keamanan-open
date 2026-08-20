@@ -1079,8 +1079,8 @@ INDEX_HTML = r"""<!doctype html>
 
   .right { display:flex; flex-direction:column; min-height:0; padding:16px; gap:14px; overflow:auto; }
   .stage { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
-  .screen { position:relative; aspect-ratio:16/9; max-height:56vh; background:var(--screen); display:flex; align-items:center; justify-content:center; }
-  .screen video, .screen img { width:100%; height:100%; object-fit:contain; display:block; background:var(--screen); }
+  .screen { position:relative; background:var(--screen); display:flex; align-items:center; justify-content:center; min-height:180px; }
+  .screen video, .screen img { max-width:100%; max-height:52vh; width:auto; height:auto; object-fit:contain; display:block; background:var(--screen); }
   .scan { position:absolute; inset:0; pointer-events:none; background:repeating-linear-gradient(var(--scan) 0 1px, transparent 1px 3px); }
   .rec { position:absolute; top:10px; left:12px; display:flex; align-items:center; gap:6px; font-size:11px; color:#e8746b; font-weight:600; letter-spacing:.04em; text-shadow:0 1px 2px #000; z-index:2; }
   .rec .b { width:8px; height:8px; border-radius:50%; background:#e8746b; }
