@@ -11,4 +11,3 @@ proximity_thresh: 0.5
 appearance_thresh: 0.7 # knob rupa: ambang kemiripan
 with_reid: true # nyalakan reid
 model: auto  # pakai fitur model deteksi sendiri, tanpa unduh model kedua
-proximity_tresh: 0.9
