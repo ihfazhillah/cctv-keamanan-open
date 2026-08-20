@@ -773,6 +773,8 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path.startswith("/static/"):
             self._serve(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"),
                         u.path[len("/static/"):])
+        elif u.path.startswith("/thumb/"):
+            self._thumb(os.path.join(ROOT, MEDIA_DIR), u.path[len("/thumb/"):])
         elif u.path.startswith("/media/"):
             self._serve(os.path.join(ROOT, MEDIA_DIR), u.path[len("/media/"):],
                         download=(qs.get("download", ["0"])[0] == "1"))
@@ -858,6 +860,29 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     break
                 remaining -= len(chunk)
+
+    def _thumb(self, base_dir, name):
+        """Poster JPEG (frame ~0.5s) dari file media, di-cache di ROOT/.thumbs.
+        Preview tanpa perlu klik play. Pakai ffmpeg (sudah dependensi grab)."""
+        name = os.path.basename(unquote(name))
+        media = os.path.join(base_dir, name)
+        if not os.path.isfile(media):
+            self.send_error(404)
+            return
+        tpath = os.path.join(base_dir, ".thumbs", name + ".jpg")   # di dalam out/ -> ter-gitignore
+        try:
+            if not (os.path.isfile(tpath) and os.path.getmtime(tpath) >= os.path.getmtime(media)):
+                os.makedirs(os.path.dirname(tpath), exist_ok=True)
+                subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                     "-ss", "0.5", "-i", media, "-frames:v", "1", "-vf", "scale=360:-2", tpath],
+                    timeout=15, stdin=subprocess.DEVNULL)
+        except Exception:
+            pass
+        if not os.path.isfile(tpath):
+            self.send_error(404)
+            return
+        self._serve_path(tpath, name + ".jpg")
 
     def _frame(self, qs):
         """Snapshot JPEG kamera (proxy go2rtc) utk editor garis. camera -> stream via
@@ -1053,7 +1078,7 @@ INDEX_HTML = r"""<!doctype html>
 
   .right { display:flex; flex-direction:column; min-height:0; padding:16px; gap:14px; overflow:auto; }
   .stage { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
-  .screen { position:relative; aspect-ratio:16/9; background:var(--screen); display:flex; align-items:center; justify-content:center; }
+  .screen { position:relative; aspect-ratio:16/9; max-height:56vh; background:var(--screen); display:flex; align-items:center; justify-content:center; }
   .screen video, .screen img { width:100%; height:100%; object-fit:contain; display:block; background:var(--screen); }
   .scan { position:absolute; inset:0; pointer-events:none; background:repeating-linear-gradient(var(--scan) 0 1px, transparent 1px 3px); }
   .rec { position:absolute; top:10px; left:12px; display:flex; align-items:center; gap:6px; font-size:11px; color:#e8746b; font-weight:600; letter-spacing:.04em; text-shadow:0 1px 2px #000; z-index:2; }
@@ -1061,8 +1086,8 @@ INDEX_HTML = r"""<!doctype html>
   .osd-tr { position:absolute; top:10px; right:12px; font-size:11.5px; color:#d7e0ea; text-shadow:0 1px 2px #000; z-index:2; }
   .stage .cap { display:flex; align-items:center; gap:10px; padding:8px 12px; border-top:1px solid var(--line); }
   .stage .cap .fn { color:var(--faint); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .stage .cap a { margin-left:auto; color:var(--accent); text-decoration:none; font-weight:600; font-size:12.5px; white-space:nowrap; }
-  .stage .cap a:hover { text-decoration:underline; }
+  .stage .cap a { margin-left:auto; background:var(--accent); color:#fff; padding:7px 13px; border-radius:8px; text-decoration:none; font-weight:700; font-size:12.5px; white-space:nowrap; }
+  .stage .cap a:hover { filter:brightness(1.08); text-decoration:none; }
 
   /* Live: grid semua kamera (gaya video-call). Klik ⛶ -> layar penuh 1 kamera. */
   .stage.livewrap { background:transparent; border:0; box-shadow:none; overflow:visible; flex:1; min-height:0; }
@@ -1397,17 +1422,21 @@ function select(id, playlistMode){
   }
 }
 
+// poster thumbnail (frame ~0.5s via /thumb) supaya klip TERLIHAT tanpa klik play.
+// hanya untuk file /media (klip tersimpan); url lain (nvr/segclip) tak ada thumb -> tanpa poster.
+function posterAttr(url){ return (url && url.indexOf('/media/')===0) ? `poster="${url.replace('/media/','/thumb/')}" ` : ''; }
+
 function renderEpStage(e){
   if(e.media){    // klip transit tersimpan -> putar langsung
     $("#stage").innerHTML = `
       <div class="screen">
-        <video id="vid" controls autoplay playsinline src="${e.media.url}"></video>
+        <video id="vid" controls autoplay playsinline preload="metadata" ${posterAttr(e.media.url)}src="${e.media.url}"></video>
         <div class="scan"></div>
         <div class="rec"><span class="b"></span>${e.dir.toUpperCase()}</div>
         <div class="osd-tr mono">${e.when} · ${e.dur.toFixed(1)}s</div>
       </div>
       <div class="cap"><span class="fn mono">${e.media.file}</span>
-        <a href="${e.media.url}?download=1">⬇ unduh klip transit</a></div>`;
+        <a download href="${e.media.url}?download=1">⬇ unduh klip transit</a></div>`;
   } else {
     $("#stage").innerHTML = `<div class="placeholder">
       Episode <span class="tag ${dirClass(e.dir)}">${e.dir}</span> · ${e.gates.join(" + ")} · ${e.dur.toFixed(1)}s<br>
@@ -1458,9 +1487,9 @@ function updateRange(){
 function playUrl(url, file, tag){
   killHls();
   $("#stage").innerHTML = `
-    <div class="screen"><video controls autoplay playsinline src="${url}"></video>
+    <div class="screen"><video controls autoplay playsinline preload="metadata" ${posterAttr(url)}src="${url}"></video>
       <div class="scan"></div><div class="rec"><span class="b"></span>${tag||"NVR"}</div></div>
-    <div class="cap"><span class="fn mono">${file}</span><a href="${url}?download=1">⬇ unduh</a></div>`;
+    <div class="cap"><span class="fn mono">${file}</span><a download href="${url}?download=1">⬇ unduh</a></div>`;
 }
 async function grabNvr(){
   if(!SELE) return;
@@ -1474,7 +1503,7 @@ async function grabNvr(){
       st.textContent = r.cached ? "sudah ada (cache)" : `selesai · ${((r.size||0)/1e6).toFixed(1)} MB`;
       $("#nvrResult").innerHTML = `<div class="done">
         <button class="playnvr" data-u="${r.url}" data-f="${r.file}">▶ putar hasil</button>
-        <a class="dl" href="${r.url}?download=1">⬇ unduh (${r.seconds}s)</a>
+        <a class="dl" download href="${r.url}?download=1">⬇ unduh (${r.seconds}s)</a>
         <span class="mono med">${r.file}</span></div>`;
       $("#nvrResult .playnvr").onclick = ev => playUrl(ev.currentTarget.dataset.u, ev.currentTarget.dataset.f);
       playUrl(r.url, r.file);
@@ -1611,7 +1640,7 @@ async function grabSeg(){
       st.textContent = r.cached ? "sudah ada (cache)" : `selesai · ${((r.size||0)/1e6).toFixed(1)} MB`;
       $("#segResult").innerHTML = `<div class="done">
         <button class="playseg" data-u="${r.url}" data-f="${r.file}">▶ putar hasil</button>
-        <a class="dl" href="${r.url}?download=1">⬇ unduh (${r.seconds}s)</a>
+        <a class="dl" download href="${r.url}?download=1">⬇ unduh (${r.seconds}s)</a>
         <span class="mono med">${r.file}</span></div>`;
       $("#segResult .playseg").onclick = ev => playUrl(ev.currentTarget.dataset.u, ev.currentTarget.dataset.f, "ARSIP");
       playUrl(r.url, r.file, "ARSIP");
@@ -1628,13 +1657,13 @@ function renderStage(e, playlistMode){
   if(e.media.type==="video"){
     stage.innerHTML = `
       <div class="screen">
-        <video id="vid" controls autoplay playsinline></video>
+        <video id="vid" controls autoplay playsinline preload="metadata" ${posterAttr(e.media.url)}></video>
         <div class="scan"></div>
         <div class="rec"><span class="b"></span>REC</div>
         <div class="osd-tr mono">${e.when}${e.dur!=null? " · "+e.dur.toFixed(1)+"s":""}</div>
       </div>
       <div class="cap"><span class="fn mono">${e.media.file}</span>
-        <a href="${e.media.url}?download=1">⬇ unduh klip</a></div>`;
+        <a download href="${e.media.url}?download=1">⬇ unduh klip</a></div>`;
     const v = $("#vid");
     v.src = e.media.url;
     if(playlistMode) v.onended = playNext;
@@ -1647,7 +1676,7 @@ function renderStage(e, playlistMode){
         <div class="osd-tr mono">${e.when}</div>
       </div>
       <div class="cap"><span class="fn mono">${e.media.file}</span>
-        <a href="${e.media.url}?download=1">⬇ unduh snapshot</a></div>`;
+        <a download href="${e.media.url}?download=1">⬇ unduh snapshot</a></div>`;
   }
 }
 
