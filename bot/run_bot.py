@@ -389,12 +389,31 @@ def _kategori(kind, p):
     return None
 
 
-def _hist_events(con):
-    """Event 'penting' terbaru-dulu, sudah berkategori: {id, ts, kat, cam, arah, zona}."""
-    q = ("SELECT id, ts, kind, zone, payload FROM events WHERE kind IN (%s) "
-         "ORDER BY id DESC LIMIT 800" % ",".join("?" * len(HIST_KINDS)))
+def _today_str():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _day_range(dstr):
+    lo = time.mktime(time.strptime(dstr, "%Y-%m-%d"))
+    return lo, lo + 86400
+
+
+def _shift_day(dstr, delta):
+    lo, _ = _day_range(dstr)
+    return time.strftime("%Y-%m-%d", time.localtime(lo + delta * 86400))
+
+
+def _hist_events(con, dstr=None):
+    """Event 'penting' terbaru-dulu, sudah berkategori: {id, ts, kat, cam, arah, zona}.
+    dstr=YYYY-MM-DD -> hanya hari itu; None -> 800 terbaru (semua hari)."""
+    base = "SELECT id, ts, kind, zone, payload FROM events WHERE kind IN (%s)" % ",".join("?" * len(HIST_KINDS))
+    if dstr:
+        lo, hi = _day_range(dstr)
+        rows = con.execute(base + " AND ts>=? AND ts<? ORDER BY id DESC", (*HIST_KINDS, lo, hi))
+    else:
+        rows = con.execute(base + " ORDER BY id DESC LIMIT 800", HIST_KINDS)
     out = []
-    for r in con.execute(q, HIST_KINDS):
+    for r in rows:
         p = json.loads(r["payload"] or "{}")
         kat = _kategori(r["kind"], p)
         if not kat:
@@ -406,12 +425,14 @@ def _hist_events(con):
 
 
 def _hist_state(chat):
-    return _hist.setdefault(chat, {"pg": 0, "j": set(), "c": set(), "a": set()})
+    return _hist.setdefault(chat, {"pg": 0, "d": _today_str(), "j": set(), "c": set(), "a": set()})
 
 
 def layar_history(con, chat):
     st = _hist_state(chat)
-    ev = _hist_events(con)
+    ev = _hist_events(con, st["d"])
+    dlabel = ("Semua (terbaru)" if st["d"] is None
+              else "Hari ini" if st["d"] == _today_str() else st["d"])
     if st["j"]:
         ev = [e for e in ev if e["kat"] in st["j"]]      # filter jenis (= search)
     if st["c"]:
@@ -422,7 +443,7 @@ def layar_history(con, chat):
     st["pg"] = max(0, min(st["pg"], npage - 1))
     page = ev[st["pg"] * HIST_PER:(st["pg"] + 1) * HIST_PER]
 
-    baris = [f"📜 History · {len(ev)} event · terbaru dulu"]
+    baris = [f"📜 History · {dlabel} · {len(ev)} event"]
     aktif = []
     if st["j"]:
         aktif.append("jenis:" + ",".join(KAT_FULL[j].split(" ", 1)[1] for j in st["j"]))
@@ -445,6 +466,11 @@ def layar_history(con, chat):
         kb.row(*[_tombol(f"🎬{i}", f"hist:clip:{e['id']}") for i, e in enumerate(page, 1)])
     kb.row(_tombol("◀️", "hist:pg:-"), _tombol(f"{st['pg'] + 1}/{npage}", "hist:noop"),
            _tombol("▶️", "hist:pg:+"))
+    if st["d"] is None:
+        kb.row(_tombol("📅 Ke tanggal (hari ini)", "hist:d:today"))
+    else:
+        kb.row(_tombol("◀️ hari", "hist:d:prev"), _tombol(dlabel, "hist:noop"),
+               _tombol("hari ▶️", "hist:d:next"), _tombol("🗓️ Semua", "hist:d:all"))
     kb.row(*[_tombol(("✅" if k in st["j"] else "") + chip, f"hist:j:{k}") for k, chip, _ in KATEGORI])
     kb.row(*[_tombol(("✅" if c in st["c"] else "") + c, f"hist:c:{c}") for c in ("garasi", "taman")])
     kb.row(*[_tombol(("✅" if a in st["a"] else "") + a, f"hist:a:{a}")
@@ -523,7 +549,7 @@ def cmd_history(message):
         return
     con = db.connect(DB_PATH)
     db.init_db(con)
-    _hist[message.chat.id] = {"pg": 0, "j": set(), "c": set(), "a": set()}   # reset tiap buka
+    _hist[message.chat.id] = {"pg": 0, "d": _today_str(), "j": set(), "c": set(), "a": set()}  # buka = hari ini
     txt, kb = layar_history(con, message.chat.id)
     bot.send_message(message.chat.id, txt, reply_markup=kb)
     con.close()
@@ -633,14 +659,28 @@ def on_callback(c):
             st = _hist_state(chat)
             st["pg"] += 1 if data.endswith("+") else -1
             tampil(con, chat, mid, "history"); bot.answer_callback_query(c.id)
-        elif data.startswith(("hist:j:", "hist:c:", "hist:a:")):   # toggle filter (bukan hist:clip:)
+        elif data.startswith("hist:d:"):                     # navigasi tanggal
+            st = _hist_state(chat)
+            what = data.split(":")[2]
+            if what == "prev":
+                st["d"] = _shift_day(st["d"] or _today_str(), -1)
+            elif what == "next":
+                st["d"] = _shift_day(st["d"] or _today_str(), +1)
+            elif what == "today":
+                st["d"] = _today_str()
+            elif what == "all":
+                st["d"] = None
+            st["pg"] = 0
+            tampil(con, chat, mid, "history"); bot.answer_callback_query(c.id)
+        elif data.startswith(("hist:j:", "hist:c:", "hist:a:")):   # toggle filter (bukan hist:clip:/hist:d:)
             _, dim, val = data.split(":", 2)                 # hist:<dim>:<val>
             s = _hist_state(chat)[dim]
             (s.discard if val in s else s.add)(val)
             _hist_state(chat)["pg"] = 0
             tampil(con, chat, mid, "history"); bot.answer_callback_query(c.id)
         elif data == "hist:reset":
-            _hist[chat] = {"pg": 0, "j": set(), "c": set(), "a": set()}
+            st = _hist_state(chat)                            # reset filter, PERTAHANKAN tanggal
+            st["pg"], st["j"], st["c"], st["a"] = 0, set(), set(), set()
             tampil(con, chat, mid, "history"); bot.answer_callback_query(c.id, "Filter direset")
         elif data.startswith("hist:clip:"):
             bot.answer_callback_query(c.id, "⏳ memotong klip…")
